@@ -874,19 +874,45 @@ async fn run_invite(vault_path: &Path, group_label: &str, target: &str) -> Resul
     } else {
         format!("{peer_onion}:{VIRTUAL_PORT}")
     };
-    println!("[balchat] dial {dial_target} para invitar...");
-    let stream = retry_dial(&endpoint, &dial_target, 3).await?;
     let expected_pubkey = vault
         .get_contact_by_onion(&peer_onion)?
         .and_then(|c| c.expected_pubkey);
-    let commit = invite_peer_to_existing_group(
-        stream,
-        &identity,
-        &our_onion,
-        &mut group,
-        expected_pubkey.as_deref(),
-    )
-    .await?;
+
+    // Camino preferente: handshake live. Si el peer no responde, caemos al
+    // flow offline (consume KP del relay + add_members local + put Welcome).
+    println!("[balchat] dial {dial_target} para invitar...");
+    let dial_result = retry_dial(&endpoint, &dial_target, 3).await;
+    let commit_bytes = match dial_result {
+        Ok(stream) => {
+            let commit = invite_peer_to_existing_group(
+                stream,
+                &identity,
+                &our_onion,
+                &mut group,
+                expected_pubkey.as_deref(),
+            )
+            .await?;
+            commit
+                .tls_serialize_detached()
+                .map_err(|e| anyhow!("serializar commit: {e:?}"))?
+        }
+        Err(dial_err) => {
+            eprintln!("[balchat] peer no responde directo ({dial_err:#}); intentando offline...");
+            invite_peer_offline_via_relay(
+                &endpoint,
+                &vault,
+                &identity,
+                &peer_onion,
+                expected_pubkey.as_deref(),
+                &mut group,
+            )
+            .await
+            .with_context(|| {
+                "invite offline falló — verifica que el peer haya publicado KeyPackages \
+                 (`balchat publish-kp`) y que el relay sea alcanzable"
+            })?
+        }
+    };
     identity::save(&vault, &identity)?;
     vault.add_group_member(group_label, &peer_onion)?;
     println!(
@@ -898,9 +924,6 @@ async fn run_invite(vault_path: &Path, group_label: &str, target: &str) -> Resul
         return Ok(());
     }
 
-    let commit_bytes = commit
-        .tls_serialize_detached()
-        .map_err(|e| anyhow!("serializar commit: {e:?}"))?;
     println!(
         "[balchat] diseminando Commit a {} miembro(s) existente(s)...",
         existing_members.len()
@@ -921,6 +944,84 @@ async fn run_invite(vault_path: &Path, group_label: &str, target: &str) -> Resul
         }
     }
     Ok(())
+}
+
+/// Camino offline para invitar un peer que no está alcanzable directo:
+/// consumimos un KeyPackage del pool del relay del peer, hacemos `add_members`
+/// localmente (lo cual genera un Commit + Welcome), encolamos el Welcome en el
+/// queue del peer y devolvemos el Commit serializado para que el caller lo
+/// disemine a los demás miembros del grupo.
+///
+/// El peer debe haber publicado KeyPackages previamente (`balchat publish-kp` o
+/// `balchat watch --listen`); si el pool está vacío, esto falla con un mensaje
+/// específico.
+async fn invite_peer_offline_via_relay(
+    endpoint: &Endpoint,
+    vault: &Vault,
+    identity: &Identity,
+    peer_onion: &str,
+    expected_pubkey: Option<&[u8]>,
+    group: &mut openmls::group::MlsGroup,
+) -> Result<Vec<u8>> {
+    let contact = vault
+        .get_contact_by_onion(peer_onion)?
+        .ok_or_else(|| anyhow!("contacto '{peer_onion}' desconocido — `add-contact` primero"))?;
+    let peer_relay = contact
+        .relay_onion
+        .clone()
+        .ok_or_else(|| anyhow!("contact sin --relay configurado; no se puede invitar offline"))?;
+    let peer_queue = contact
+        .relay_queue_id
+        .clone()
+        .ok_or_else(|| anyhow!("contact sin --queue configurado; no se puede invitar offline"))?;
+
+    let client = RelayClient::new(endpoint);
+
+    println!("[balchat] consumiendo KeyPackage del relay del peer...");
+    let kp_bytes = client
+        .consume_keypackage(&peer_relay, &peer_queue)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "pool de KeyPackages del peer vacío — pedile que corra \
+                 `balchat publish-kp` y reintenta"
+            )
+        })?;
+
+    let peer_kp_in = openmls::prelude::KeyPackageIn::tls_deserialize_exact_bytes(&kp_bytes)
+        .map_err(|e| anyhow!("deserializar KeyPackage del peer: {e:?}"))?
+        .validate(
+            openmls_traits::OpenMlsProvider::crypto(&identity.provider),
+            openmls::prelude::ProtocolVersion::Mls10,
+        )
+        .map_err(|e| anyhow!("validar KeyPackage del peer: {e:?}"))?;
+
+    if let Some(expected) = expected_pubkey {
+        let actual = peer_kp_in.leaf_node().signature_key().as_slice();
+        if actual != expected {
+            bail!("pubkey del peer no coincide con --pubkey esperado en invite offline");
+        }
+    }
+
+    println!("[balchat] add_members local (genera Commit + Welcome)...");
+    let (commit_msg, welcome_out, _info) = group
+        .add_members(&identity.provider, &identity.signer, &[peer_kp_in])
+        .map_err(|e| anyhow!("add_members: {e:?}"))?;
+    group
+        .merge_pending_commit(&identity.provider)
+        .map_err(|e| anyhow!("merge_pending_commit: {e:?}"))?;
+
+    let welcome_bytes = welcome_out
+        .tls_serialize_detached()
+        .map_err(|e| anyhow!("serializar Welcome: {e:?}"))?;
+
+    println!("[balchat] PUT Welcome al relay del peer...");
+    let seq = client.put(&peer_relay, &peer_queue, welcome_bytes).await?;
+    println!("[balchat] Welcome encolado seq={seq}");
+
+    commit_msg
+        .tls_serialize_detached()
+        .map_err(|e| anyhow!("serializar commit: {e:?}"))
 }
 
 async fn run_send_group(vault_path: &Path, group_label: &str, text: &str) -> Result<()> {

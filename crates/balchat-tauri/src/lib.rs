@@ -672,6 +672,58 @@ async fn poll_and_emit(
 
     let mut new_last = last_seq;
     for msg in &messages {
+        // Detectar Welcomes que llegan vía relay (peer offline nos invitó a un
+        // grupo). Si el blob es un Welcome, joineamos el grupo, lo registramos
+        // en el vault con un label sintético para que aparezca en la lista de
+        // contactos/grupos, y emitimos un Info al frontend. Después seguimos al
+        // siguiente blob (no llamamos a decrypt_blob porque no es App message).
+        if identity::blob_is_welcome(&msg.blob) {
+            match identity::process_welcome_blob(identity, &msg.blob) {
+                Ok(group_id) => {
+                    if let Err(e) = identity::save(vault, identity) {
+                        tracing::warn!("identity::save tras Welcome falló: {e:#}");
+                    }
+                    if vault
+                        .get_group_by_mls_id(&group_id)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        let label = format!("inbox-{}", &hex_encode(&group_id)[..8]);
+                        if let Err(e) = vault.create_group(&label, &group_id) {
+                            tracing::warn!("registrar grupo offline en vault falló: {e:#}");
+                        }
+                    }
+                    let _ = app.emit(
+                        "balchat://message",
+                        LogEntry::Info {
+                            text: format!(
+                                "joineado grupo MLS via Welcome offline (group_id={})",
+                                &hex_encode(&group_id)[..16]
+                            ),
+                        },
+                    );
+                    send_system_notification(
+                        app,
+                        "balchat",
+                        "te han invitado a un grupo nuevo",
+                    );
+                }
+                Err(e) => {
+                    let _ = app.emit(
+                        "balchat://message",
+                        LogEntry::Error {
+                            text: format!("procesar Welcome falló (seq={}): {e:#}", msg.seq),
+                        },
+                    );
+                }
+            }
+            if msg.seq > new_last {
+                new_last = msg.seq;
+            }
+            continue;
+        }
+
         match decrypt_blob(identity, &msg.blob) {
             Ok((payload, group_id)) => {
                 // Resolvemos al contacto vía group_id; si no lo encontramos,

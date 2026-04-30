@@ -426,6 +426,98 @@ mod tests {
         Ok(())
     }
 
+    /// Flujo offline-invite (fase 5a): Alice arma un grupo, consume un KeyPackage
+    /// de Bob (lo que en producción sale del relay del peer), hace `add_members`
+    /// localmente y obtiene un Welcome bytes. Bob procesa el Welcome con
+    /// `process_welcome_blob` y queda joineado al mismo `group_id`. Verificamos
+    /// que después de eso, un Application message de Alice se descifra OK en Bob —
+    /// confirma que ambos están en el mismo MLS state sin handshake live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offline_welcome_via_keypackage_pool() -> Result<()> {
+        use crate::identity;
+        use openmls::prelude::tls_codec::Serialize as _;
+        use openmls::prelude::{KeyPackageIn, MlsMessageIn, ProcessedMessageContent, ProtocolVersion};
+        use openmls_traits::OpenMlsProvider as _;
+
+        let alice = Identity::new("alice")?;
+        let bob = Identity::new("bob")?;
+
+        // 1) Bob publica un KeyPackage (en producción iría al pool del relay).
+        let bob_kp_bundle = bob.fresh_key_package()?;
+        let bob_kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize KP: {e:?}"))?;
+
+        // 2) Alice consume el KP, valida y hace add_members local.
+        let bob_kp_in = KeyPackageIn::tls_deserialize_exact_bytes(&bob_kp_bytes)
+            .map_err(|e| anyhow!("deserialize KP: {e:?}"))?
+            .validate(alice.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| anyhow!("validate KP: {e:?}"))?;
+        let mut alice_group = identity::create_group(&alice)?;
+        let alice_group_id = alice_group.group_id().as_slice().to_vec();
+        let (_commit, welcome_out, _info) = alice_group
+            .add_members(&alice.provider, &alice.signer, &[bob_kp_in])
+            .map_err(|e| anyhow!("add_members: {e:?}"))?;
+        alice_group
+            .merge_pending_commit(&alice.provider)
+            .map_err(|e| anyhow!("merge: {e:?}"))?;
+        let welcome_bytes = welcome_out
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize Welcome: {e:?}"))?;
+
+        // 3) Bob detecta que es un Welcome (sniff sin descifrar) y lo procesa.
+        assert!(
+            identity::blob_is_welcome(&welcome_bytes),
+            "blob_is_welcome debe identificar el Welcome correctamente"
+        );
+        let bob_group_id = identity::process_welcome_blob(&bob, &welcome_bytes)?;
+        assert_eq!(
+            bob_group_id, alice_group_id,
+            "Bob debe joinear al mismo group_id que Alice"
+        );
+
+        // 4) Sanity check end-to-end: Alice manda un Application msg, Bob lo descifra.
+        let payload = AppPayload::Text("offline-invite OK".into());
+        let mut payload_bytes = Vec::with_capacity(64);
+        ciborium::ser::into_writer(&payload, &mut payload_bytes)?;
+        let app_out = alice_group
+            .create_message(&alice.provider, &alice.signer, &payload_bytes)
+            .map_err(|e| anyhow!("create_message: {e:?}"))?;
+        let app_blob = app_out
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize app msg: {e:?}"))?;
+
+        let bob_group = openmls::group::MlsGroup::load(
+            bob.provider.storage(),
+            &openmls::group::GroupId::from_slice(&bob_group_id),
+        )
+        .map_err(|e| anyhow!("load bob group: {e:?}"))?
+        .ok_or_else(|| anyhow!("bob group no se encontró tras process_welcome"))?;
+
+        let in_msg = MlsMessageIn::tls_deserialize_exact_bytes(&app_blob)
+            .map_err(|e| anyhow!("deserialize app msg: {e:?}"))?;
+        let proto: openmls::framing::ProtocolMessage = in_msg
+            .try_into_protocol_message()
+            .map_err(|_| anyhow!("frame no es ProtocolMessage"))?;
+        let mut bob_group_mut = bob_group;
+        let processed = bob_group_mut
+            .process_message(&bob.provider, proto)
+            .map_err(|e| anyhow!("process_message: {e:?}"))?;
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(app) => {
+                let bytes = app.into_bytes();
+                let payload: AppPayload = ciborium::de::from_reader(&bytes[..])?;
+                match payload {
+                    AppPayload::Text(t) => assert_eq!(t, "offline-invite OK"),
+                    other => panic!("esperaba Text, llegó {other:?}"),
+                }
+            }
+            other => panic!("esperaba ApplicationMessage, llegó {other:?}"),
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_payload_roundtrip() -> Result<()> {
         let alice = Identity::new("alice")?;

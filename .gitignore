@@ -43,3 +43,7 @@ crates/balchat-tauri/gen/schemas/
 
 # Claude Code local state
 .claude/
+
+# Briefs / artefactos generados localmente (PDF deck, exports)
+balchat-brief.pdf
+*.pdf

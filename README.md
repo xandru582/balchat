@@ -392,7 +392,7 @@ y publicarlo via Play Store o como FDroid build.**
 | 4a | UI: agregar/borrar contactos, auto-arranque daemon, lock | ✓ |
 | 4b | UI: histórico persistido + timestamps + auto-scroll | ✓ |
 | 4c | UI: notificaciones + file transfer + copiar onion | ✓ |
-| 5a | Welcome offline vía relay (grupos con miembros offline) | pendiente |
+| 5a | Welcome offline vía relay (grupos con miembros offline) | ✓ |
 | 5b | Multi-ABI APK (armv7 + x86_64 + x86) | pendiente — hoy sólo arm64 |
 | 5c | iOS | pendiente |
 | 5d | Auditoría de protocolo + KAT formales | pendiente |
@@ -404,8 +404,11 @@ y publicarlo via Play Store o como FDroid build.**
 - **Send-file vía relay limitado a ~14 MiB** (cabe en un solo MLS Application
   message). Files más grandes requieren chunking + reassembly que no está
   implementado.
-- **Grupos n-way con miembros offline:** invitar a alguien que no está alcanzable
-  deja a ese miembro con el epoch viejo. Welcome via relay (5a) lo resolverá.
+- **Grupos n-way: dissemination del Commit a miembros offline.** El comando
+  `invite` ahora cae al relay si el peer nuevo no está online (Welcome offline
+  funciona, fase 5a). Pero el `Commit` que se disemina a los **otros** miembros
+  ya existentes solo intenta directo + relay vía `deliver_to_member`; si alguno
+  está offline y sin relay, queda con epoch viejo hasta el próximo handshake live.
 - **Relay no autentica:** queue_id es la credencial. Conocerlo permite leer/borrar
   blobs (no descifrarlos). Los queue_ids se distribuyen out-of-band entre peers
   que ya se confían.
@@ -439,18 +442,20 @@ y publicarlo via Play Store o como FDroid build.**
 cargo test --workspace                  # storage + core (sin Tor; usan DuplexStream)
 ```
 
-Cobertura actual:
-- `balchat-storage`: 6 tests — vault create/open, KV roundtrip, contacts upsert,
+Cobertura actual (12/12 passing):
+- `balchat-storage` — 6 tests: vault create/open, KV roundtrip, contacts upsert,
   passphrases con caracteres raros, vaults legacy sin salt, messages
   insert/list/limit, delete cascade.
-- `balchat-core`: tests de Conversation con `tokio::io::duplex` (no requiere Tor)
-  cubriendo handshake, application messages, Welcome, Resume, group commits.
+- `balchat-core` — 6 tests: identity roundtrip, KeyPackage tras restore,
+  fresh handshake con texto y archivos, cross-sign mismatch aborta handshake,
+  **Welcome offline vía KeyPackage pool** (fase 5a — Alice add_members → Welcome
+  bytes → Bob process_welcome_blob → app message roundtrip).
 
 ---
 
 ## Roadmap
 
-- [ ] Welcome offline vía relay (5a)
+- [x] Welcome offline vía relay (5a)
 - [ ] Multi-ABI APK (5b)
 - [ ] iOS (5c)
 - [ ] Auditoría de protocolo + tests KAT (5d)
