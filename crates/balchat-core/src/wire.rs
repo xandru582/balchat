@@ -76,3 +76,117 @@ where
         .map_err(|e| anyhow!("CBOR decode: {e}"))?;
     Ok(frame)
 }
+
+#[cfg(test)]
+mod kat_tests {
+    //! Known-Answer Tests del wire format. Si cualquiera de estos falla,
+    //! el wire format cambió de manera incompatible — peers viejos no van
+    //! a poder hablar con peers nuevos. Bumpear `PROTOCOL_VERSION` y
+    //! actualizar los vectores deliberadamente cuando esto suceda.
+    use super::*;
+    use tokio::io::duplex;
+
+    fn cbor(frame: &Frame) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(frame, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn bye_is_canonical_4_bytes() {
+        // ciborium externally-tagged: unit variant `Bye` se serializa como la
+        // string CBOR "Bye": 0x63 (text-string-of-length-3) + "Bye" UTF-8.
+        let bytes = cbor(&Frame::Bye);
+        assert_eq!(
+            bytes,
+            [0x63, b'B', b'y', b'e'],
+            "Frame::Bye debe serializar a 4 bytes exactos: text-string('Bye')"
+        );
+    }
+
+    #[test]
+    fn hello_no_resume_canonical() {
+        // Hello { protocol_version: 1, my_onion: "x.onion:1234", resume_group_id: None }
+        // ciborium externally-tagged: { "Hello": { "protocol_version":1, ... } }
+        let f = Frame::Hello {
+            protocol_version: 1,
+            my_onion: "x.onion:1234".into(),
+            resume_group_id: None,
+        };
+        let bytes = cbor(&f);
+        // Sanidad: que termine con "x.onion:1234" string (text-string CBOR).
+        let end = b"\x6cx.onion:1234"; // 0x6c = text-string len 12
+        assert!(
+            bytes.windows(end.len()).any(|w| w == end),
+            "Hello debería contener text-string('x.onion:1234'); got {:?}",
+            hex::encode(&bytes)
+        );
+        // Roundtrip:
+        let de: Frame = ciborium::de::from_reader(&bytes[..]).unwrap();
+        match de {
+            Frame::Hello {
+                protocol_version,
+                my_onion,
+                resume_group_id,
+            } => {
+                assert_eq!(protocol_version, 1);
+                assert_eq!(my_onion, "x.onion:1234");
+                assert_eq!(resume_group_id, None);
+            }
+            other => panic!("esperaba Hello, llegó {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_recv_frame_roundtrip_with_length_prefix() {
+        // Verifica el envoltorio length-prefixed: send_frame escribe
+        // `[u32 BE len][cbor]` y recv_frame lo recupera idéntico.
+        let (mut a, mut b) = duplex(64 * 1024);
+        let f = Frame::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            my_onion: "alice.onion:1234".into(),
+            resume_group_id: Some(vec![1, 2, 3, 4, 5]),
+        };
+        send_frame(&mut a, &f).await.unwrap();
+        let de = recv_frame(&mut b).await.unwrap();
+        match de {
+            Frame::Hello {
+                protocol_version,
+                my_onion,
+                resume_group_id,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(my_onion, "alice.onion:1234");
+                assert_eq!(resume_group_id, Some(vec![1, 2, 3, 4, 5]));
+            }
+            other => panic!("esperaba Hello, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keypackage_bytes_preserved() {
+        let payload: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
+        let f = Frame::KeyPackage(payload.clone());
+        let bytes = cbor(&f);
+        let de: Frame = ciborium::de::from_reader(&bytes[..]).unwrap();
+        match de {
+            Frame::KeyPackage(p) => assert_eq!(p, payload),
+            other => panic!("esperaba KeyPackage, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_max_size_enforced() {
+        // Construimos un Frame::KeyPackage que (con overhead CBOR) supera
+        // MAX_FRAME_BYTES. Esperamos que send_frame falle con error claro
+        // sin escribir nada al stream.
+        let payload = vec![0u8; MAX_FRAME_BYTES + 1024];
+        let f = Frame::KeyPackage(payload);
+        let mut buf: Vec<u8> = Vec::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let res = rt.block_on(async { send_frame(&mut buf, &f).await });
+        assert!(res.is_err(), "frame demasiado grande debe fallar");
+    }
+}

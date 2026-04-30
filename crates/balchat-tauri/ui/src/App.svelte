@@ -46,12 +46,21 @@
   })
 
   // -- Auto-lock por inactividad --
-  // 5 minutos por default. El timer se resetea con cualquier interacción
-  // (mousemove/keydown/touchstart/click/scroll). Cuando expira, llamamos
-  // lockVault() y el AppState olvida el vault → la UI vuelve a la pantalla
-  // de unlock automáticamente.
-  const AUTO_LOCK_MS = 5 * 60 * 1000
+  // El usuario lo configura en Settings (default 5 min, 0 = desactivado). El timer
+  // se resetea con cualquier interacción (mousemove/keydown/touchstart/click/scroll).
+  // Cuando expira, llamamos lockVault() y el AppState olvida el vault → la UI vuelve
+  // a la pantalla de unlock automáticamente.
+  let autoLockMinutes = $state(5)
   let autoLockTimer = null
+
+  // -- Settings panel (engranaje en header) --
+  let showSettings = $state(false)
+  let settingsRelay = $state('')
+  let settingsAutoLock = $state(5)
+  let settingsKpCount = $state(10)
+  let settingsBusy = $state(false)
+  let settingsError = $state('')
+  let settingsInfo = $state('')
 
   let unlistenMessage
   let unlistenStatus
@@ -96,7 +105,8 @@
   function resetAutoLockTimer() {
     if (!unlocked) return
     if (autoLockTimer) clearTimeout(autoLockTimer)
-    autoLockTimer = setTimeout(() => { lockVault('inactivity') }, AUTO_LOCK_MS)
+    if (autoLockMinutes <= 0) return // 0 = desactivado
+    autoLockTimer = setTimeout(() => { lockVault('inactivity') }, autoLockMinutes * 60 * 1000)
   }
 
   function stopAutoLock() {
@@ -146,6 +156,7 @@
     try {
       myId = await invoke('unlock_vault', { passphrase })
       contacts = await invoke('list_contacts')
+      await loadSettings()
       unlocked = true
       passphrase = ''
       startAutoLock()
@@ -164,6 +175,7 @@
     try {
       myId = await invoke('create_vault', { passphrase, label })
       contacts = await invoke('list_contacts')
+      await loadSettings()
       unlocked = true
       passphrase = ''
       passphrase2 = ''
@@ -172,6 +184,86 @@
       unlockError = String(e)
     } finally {
       busy = false
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      const s = await invoke('get_settings_cmd')
+      autoLockMinutes = s.auto_lock_minutes
+      settingsAutoLock = s.auto_lock_minutes
+    } catch (e) {
+      console.warn('get_settings_cmd:', e)
+    }
+  }
+
+  function openSettings() {
+    settingsError = ''
+    settingsInfo = ''
+    settingsRelay = myId.relay || ''
+    settingsAutoLock = autoLockMinutes
+    showSettings = true
+  }
+
+  async function saveRelay() {
+    settingsBusy = true
+    settingsError = ''
+    settingsInfo = ''
+    try {
+      myId = await invoke('set_my_relay_cmd', { relayOnion: settingsRelay.trim() })
+      settingsInfo = 'relay actualizado'
+    } catch (e) {
+      settingsError = String(e)
+    } finally {
+      settingsBusy = false
+    }
+  }
+
+  async function saveAutoLock() {
+    settingsBusy = true
+    settingsError = ''
+    settingsInfo = ''
+    try {
+      const v = Math.max(0, Math.min(1440, Number(settingsAutoLock) | 0))
+      await invoke('set_settings_cmd', { autoLockMinutes: v })
+      autoLockMinutes = v
+      resetAutoLockTimer()
+      settingsInfo = v === 0 ? 'auto-lock desactivado' : `auto-lock = ${v} min`
+    } catch (e) {
+      settingsError = String(e)
+    } finally {
+      settingsBusy = false
+    }
+  }
+
+  async function publishKp() {
+    settingsBusy = true
+    settingsError = ''
+    settingsInfo = ''
+    try {
+      const v = Math.max(1, Math.min(100, Number(settingsKpCount) | 0))
+      const pool = await invoke('publish_kp_cmd', { count: v })
+      settingsInfo = `${v} KeyPackages publicados; pool ahora = ${pool}`
+    } catch (e) {
+      settingsError = String(e)
+    } finally {
+      settingsBusy = false
+    }
+  }
+
+  async function exportVault() {
+    settingsBusy = true
+    settingsError = ''
+    settingsInfo = ''
+    try {
+      const dir = await openDialog({ directory: true, multiple: false })
+      if (!dir) { settingsBusy = false; return }
+      const dst = await invoke('export_vault_cmd', { targetDir: String(dir) })
+      settingsInfo = `vault copiado: ${dst}`
+    } catch (e) {
+      settingsError = String(e)
+    } finally {
+      settingsBusy = false
     }
   }
 
@@ -282,6 +374,23 @@
     } catch (e) {
       log = [{ kind: 'error', text: `cargar histórico: ${e}`, created_at: Math.floor(Date.now() / 1000) }]
     }
+    // Marcar como leído y refrescar el sidebar para que el badge "no leído" se vaya.
+    try {
+      await invoke('mark_contact_read_cmd', { peer: c.onion_address })
+      await refreshContacts()
+    } catch (e) {
+      console.warn('mark_contact_read_cmd:', e)
+    }
+  }
+
+  /** Resumen corto del último mensaje para el sidebar. Recorta a 60 chars. */
+  function previewText(c) {
+    if (!c.last_body) return ''
+    const prefix = c.last_direction === 'sent' ? '→ ' : ''
+    const body = c.last_kind === 'file' ? `📎 ${c.last_body}` : c.last_body
+    const flat = body.replace(/\s+/g, ' ').trim()
+    const max = 60
+    return prefix + (flat.length > max ? flat.slice(0, max - 1) + '…' : flat)
   }
 
   /** Formatea Unix epoch (seg) como "HH:MM" en la zona local del cliente. */
@@ -393,7 +502,10 @@
         {#if daemonStatus === 'idle' || daemonStatus === 'error'}
           <button onclick={startDaemon}>Arrancar daemon</button>
         {/if}
-        <button onclick={refreshContacts}>↻</button>
+        <button onclick={refreshContacts} title="Refrescar contactos">↻</button>
+        <button class="lock-btn" onclick={openSettings} title="Settings (relay, KeyPackages, auto-lock, export)">
+          ⚙
+        </button>
         <button class="lock-btn" onclick={() => lockVault('manual')} title="Cerrar sesión (lock)">
           🔒
         </button>
@@ -469,11 +581,25 @@
               >
                 <div class="contact-row">
                   <div class="contact-info">
-                    <strong>{c.label}</strong>
-                    <small>{c.onion_address}</small>
-                    {#if c.has_group}
-                      <span class="badge">activo</span>
+                    <div class="contact-top">
+                      <strong>{c.label}</strong>
+                      {#if c.last_created_at}
+                        <small class="ts">{fmtTime(c.last_created_at)}</small>
+                      {/if}
+                    </div>
+                    {#if c.last_body}
+                      <div class="preview">{previewText(c)}</div>
+                    {:else}
+                      <small>{c.onion_address}</small>
                     {/if}
+                    <div class="contact-tags">
+                      {#if c.has_group}
+                        <span class="badge">activo</span>
+                      {/if}
+                      {#if c.unread_count > 0 && selected?.onion_address !== c.onion_address}
+                        <span class="badge unread">{c.unread_count}</span>
+                      {/if}
+                    </div>
                   </div>
                   <button
                     class="del-contact"
@@ -519,6 +645,85 @@
         {/if}
       </section>
     </div>
+
+    {#if showSettings}
+      <div
+        class="modal-backdrop"
+        onclick={() => (showSettings = false)}
+        onkeydown={(e) => e.key === 'Escape' && (showSettings = false)}
+        role="presentation"
+      >
+        <div
+          class="modal"
+          onclick={(e) => e.stopPropagation()}
+          onkeydown={(e) => e.stopPropagation()}
+          role="dialog"
+          aria-label="Settings"
+          tabindex="-1"
+        >
+          <div class="modal-header">
+            <h3>Settings</h3>
+            <button class="lock-btn" onclick={() => (showSettings = false)} aria-label="Cerrar">×</button>
+          </div>
+
+          <section class="settings-section">
+            <h4>Mi relay</h4>
+            <p class="hint">Onion del relay donde recibís blobs offline. Compartilo con quien quiera contactarte.</p>
+            <div class="row">
+              <input
+                type="text"
+                placeholder="xxxxxx.onion[:1235]"
+                bind:value={settingsRelay}
+                disabled={settingsBusy}
+              />
+              <button onclick={saveRelay} disabled={settingsBusy || !settingsRelay.trim()}>Guardar</button>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <h4>KeyPackages en mi relay</h4>
+            <p class="hint">Para que peers offline puedan invitarte a grupos. Necesita el daemon corriendo.</p>
+            <div class="row">
+              <input
+                type="number"
+                min="1"
+                max="100"
+                bind:value={settingsKpCount}
+                disabled={settingsBusy}
+                style="width: 80px"
+              />
+              <button onclick={publishKp} disabled={settingsBusy || daemonStatus !== 'running'}>Publicar</button>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <h4>Auto-lock</h4>
+            <p class="hint">Cierra el vault tras N minutos sin actividad. <code>0</code> desactiva.</p>
+            <div class="row">
+              <input
+                type="number"
+                min="0"
+                max="1440"
+                bind:value={settingsAutoLock}
+                disabled={settingsBusy}
+                style="width: 80px"
+              />
+              <span>min</span>
+              <button onclick={saveAutoLock} disabled={settingsBusy}>Guardar</button>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <h4>Backup del vault</h4>
+            <p class="hint">Copia <code>vault.db</code> + <code>.salt</code> a un directorio. Mantiene la passphrase original.</p>
+            <button onclick={exportVault} disabled={settingsBusy}>Elegir destino…</button>
+          </section>
+
+          {#if settingsError}<p class="error">{settingsError}</p>{/if}
+          {#if settingsInfo}<p class="info">{settingsInfo}</p>{/if}
+        </div>
+      </div>
+    {/if}
   {/if}
 </main>
 
@@ -662,7 +867,12 @@
   aside li:hover { background: #181825; }
   aside li.active { background: #313244; }
   aside small { color: #6c7086; font-size: 0.7rem; word-break: break-all; }
-  .badge { background: #a6e3a1; color: #1e1e2e; font-size: 0.65rem; padding: 0 4px; border-radius: 8px; align-self: flex-start; margin-top: 2px; }
+  .badge { background: #a6e3a1; color: #1e1e2e; font-size: 0.65rem; padding: 0 4px; border-radius: 8px; margin-top: 2px; margin-right: 0.25rem; }
+  .badge.unread { background: #89b4fa; color: #1e1e2e; padding: 0 6px; font-weight: 600; }
+  .preview { color: #a6adc8; font-size: 0.78rem; margin-top: 2px; word-break: break-word; overflow: hidden; text-overflow: ellipsis; max-height: 2.4em; line-height: 1.2em; }
+  .contact-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+  .contact-top .ts { color: #6c7086; font-size: 0.7rem; flex-shrink: 0; }
+  .contact-tags { display: flex; flex-wrap: wrap; align-items: center; }
   .muted { color: #6c7086; }
 
   .contact-row {
@@ -713,4 +923,62 @@
     margin: auto;
     color: #6c7086;
   }
+
+  /* -- Settings modal -- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal {
+    background: #1e1e2e;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    width: min(420px, 90vw);
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+  .modal-header h3 { margin: 0; color: #89b4fa; }
+  .settings-section { margin-bottom: 1rem; }
+  .settings-section h4 { margin: 0.25rem 0; color: #cdd6f4; font-size: 0.95rem; }
+  .settings-section .hint { color: #6c7086; font-size: 0.78rem; margin: 0.25rem 0 0.4rem; }
+  .settings-section .row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .settings-section input[type=text],
+  .settings-section input[type=number] {
+    flex: 1;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid #45475a;
+    background: #313244;
+    color: #cdd6f4;
+    border-radius: 3px;
+    font-size: 0.85rem;
+    min-width: 0;
+  }
+  .settings-section button {
+    padding: 0.4rem 0.75rem;
+    background: #89b4fa;
+    color: #1e1e2e;
+    border: 0;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .settings-section button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .info { color: #a6e3a1; font-size: 0.85rem; margin: 0.5rem 0 0; }
 </style>

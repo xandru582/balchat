@@ -6,8 +6,8 @@
 
 > ⚠️ **Estado: prototipo / spike funcional.** El protocolo está implementado, los binarios
 > compilan en macOS/Linux/Android y el flujo end-to-end funciona, pero **no hay auditoría
-> de seguridad**, los KAT formales del protocolo no están escritos, y faltan piezas
-> (iOS, Welcome offline, multi-ABI APK). No usar en escenarios reales hasta entonces.
+> externa de seguridad**, e iOS y multi-ABI Android están **scaffolded pero no verificados
+> en hardware** (ver [docs/](docs/)). No usar en escenarios reales hasta entonces.
 
 ---
 
@@ -98,11 +98,16 @@ Single Svelte 5 SPA (`crates/balchat-tauri/ui/`) sobre Tauri 2. Lo que la UI ya 
   al seleccionarlo) + **timestamps `[HH:MM]`** locales.
 - ✓ **Auto-scroll** al final cuando llegan o se envían mensajes.
 - ✓ **Envío de archivos** con file picker nativo (`tauri-plugin-dialog`),
-  hasta 14 MiB por mensaje (límite MLS).
+  con **chunking automático para archivos > 12 MiB** (split en chunks de 8 MiB,
+  reensamblaje atómico en disco con spool en `inbox/_partial/`).
 - ✓ **Notificaciones del sistema** (`tauri-plugin-notification`) cuando llega un
   mensaje o archivo, con label del contacto.
-- ✓ **Lock del vault** explícito (botón 🔒) **y auto-lock por inactividad**
-  (5 min default — configurable en código).
+- ✓ **Preview del último mensaje + badge no-leído** en la lista de contactos;
+  se ordena por actividad reciente.
+- ✓ **Lock del vault** explícito (botón 🔒) y **auto-lock por inactividad
+  configurable** desde la UI (default 5 min, 0 = desactivado).
+- ✓ **Panel Settings (⚙)**: cambiar mi relay, publicar pool de KeyPackages,
+  ajustar auto-lock, exportar backup del vault — todo sin tocar la CLI.
 - ✓ Botón **copiar mi onion** al portapapeles para compartir tu dirección.
 - ✓ Indicador de status del daemon (`idle / starting / running / error`).
 
@@ -394,17 +399,24 @@ y publicarlo via Play Store o como FDroid build.**
 | 4c | UI: notificaciones + file transfer + copiar onion | ✓ |
 | 5a | Welcome offline vía relay (grupos con miembros offline) | ✓ |
 | 5b | Commit dissemination offline (existing members reciben Add Commit por relay) | ✓ |
-| 5c | Multi-ABI APK (armv7 + x86_64 + x86) | pendiente — hoy sólo arm64 |
-| 5d | iOS | pendiente |
-| 5e | Auditoría de protocolo + KAT formales | pendiente |
+| 5c | Settings UI (set-relay, publish KP, auto-lock, export vault) | ✓ |
+| 5d | Preview último mensaje + badge no-leído + delete con cleanup MLS | ✓ |
+| 5e | Chunking de archivos > 12 MiB (split 8 MiB + spool reassembly) | ✓ |
+| 5f | KAT tests del wire format (balchat-core + relay-proto) | ✓ |
+| 5g | FDroid build script + metadata (`fdroid/`) | ✓ |
+| 5h | Multi-ABI APK (armv7 + x86_64 + x86) | scaffolded — [docs/android-multi-abi.md](docs/android-multi-abi.md) |
+| 5i | iOS | scaffolded — [docs/ios-build.md](docs/ios-build.md) |
+| 5j | Auditoría externa de protocolo | pendiente |
 
 ---
 
 ## Limitaciones conocidas
 
-- **Send-file vía relay limitado a ~14 MiB** (cabe en un solo MLS Application
-  message). Files más grandes requieren chunking + reassembly que no está
-  implementado.
+- **Receivers viejos no leen `FileChunk`**: senders con la versión 5e
+  arriba siguen mandando archivos chicos (≤ 12 MiB) como `AppPayload::File`,
+  pero un peer que todavía corra una versión < 5e va a fallar al recibir
+  un chunk de un archivo grande. El sender ve el descifrado fallar en el
+  log del peer; no hay re-fall back automático.
 - **Relay no autentica:** queue_id es la credencial. Conocerlo permite leer/borrar
   blobs (no descifrarlos). Los queue_ids se distribuyen out-of-band entre peers
   que ya se confían.
@@ -438,15 +450,22 @@ y publicarlo via Play Store o como FDroid build.**
 cargo test --workspace                  # storage + core (sin Tor; usan DuplexStream)
 ```
 
-Cobertura actual (13/13 passing):
-- `balchat-storage` — 6 tests: vault create/open, KV roundtrip, contacts upsert,
+Cobertura actual (30/30 passing):
+- `balchat-storage` — 7 tests: vault create/open, KV roundtrip, contacts upsert,
   passphrases con caracteres raros, vaults legacy sin salt, messages
-  insert/list/limit, delete cascade.
-- `balchat-core` — 7 tests: identity roundtrip, KeyPackage tras restore,
+  insert/list/limit, delete cascade, **preview del último mensaje + unread
+  count + mark_contact_read** (5d).
+- `balchat-core` — 16 tests: identity roundtrip, KeyPackage tras restore,
   fresh handshake con texto y archivos, cross-sign mismatch aborta handshake,
-  **Welcome offline vía KeyPackage pool** (fase 5a), **Commit aplicado vía blob
-  avanza el epoch del miembro existente** (fase 5b — Alice add_members(Carol),
-  Bob procesa el Commit por relay → epoch=2, descifra mensajes posteriores).
+  **Welcome offline vía KeyPackage pool** (5a), **Commit aplicado vía blob
+  avanza el epoch del miembro existente** (5b), **delete_group idempotente
+  limpia state MLS huérfano** (5d), **chunking de archivos out-of-order
+  reensambla 25 MiB en 4 chunks** (5e), **KAT canónicos del wire format**:
+  Frame::Bye 4 bytes exactos, Hello con/sin resume_group_id, KeyPackage,
+  AppPayload::Text canonical CBOR, FileChunk roundtrip, max_size enforcement.
+- `balchat-relay-proto` — 7 tests **KAT del protocolo cliente↔relay**:
+  Put/Get request roundtrip, PutAck/GetReply/ConsumeKeyPackageReply
+  (None vs Some) responses, send_recv_frame end-to-end, version pin.
 
 ---
 
@@ -454,17 +473,20 @@ Cobertura actual (13/13 passing):
 
 - [x] Welcome offline vía relay (5a)
 - [x] Commit dissemination offline (5b)
-- [ ] Multi-ABI APK (5c)
-- [ ] iOS (5d)
-- [ ] Auditoría de protocolo + tests KAT (5e)
-- [ ] Preview del último mensaje + badge "no leído" en la lista de contactos
-- [ ] Setear relay desde la UI (hoy `set-my-relay` solo CLI)
-- [ ] Publicar KeyPackage desde la UI (hoy `publish-kp` solo CLI)
-- [ ] Limpieza de MLS group state al borrar contacto (fuga menor de storage)
-- [ ] Chunking de archivos > 14 MiB
-- [ ] Configurabilidad del timeout de auto-lock desde la UI
-- [ ] Backup / export del vault encriptado
-- [ ] FDroid build script
+- [x] Settings UI: set-relay, publish KeyPackages, auto-lock configurable, export vault (5c)
+- [x] Preview último mensaje + badge no-leído + cleanup MLS al borrar contacto (5d)
+- [x] Chunking de archivos > 12 MiB con spool de reensamblaje en disco (5e)
+- [x] KAT tests del wire format en balchat-core y balchat-relay-proto (5f)
+- [x] FDroid build script + metadata YAML (5g) → [`fdroid/`](fdroid/)
+- [ ] **Multi-ABI APK** (5h) — config y docs listos en
+      [docs/android-multi-abi.md](docs/android-multi-abi.md), pendiente verificar
+      en máquina con NDK que el cross-compile de OpenSSL funciona para armv7/x86_64/i686.
+- [ ] **iOS** (5i) — scaffolding documentado en
+      [docs/ios-build.md](docs/ios-build.md); el path crítico es el handler
+      de `BGProcessingTask` para poll-relay en background, no probado en device.
+- [ ] **Auditoría externa** (5j) — pendiente. Los KATs de wire format
+      mitigan regresiones internas pero no reemplazan una review de seguridad
+      del protocolo end-to-end.
 
 ---
 

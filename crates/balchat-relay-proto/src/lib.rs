@@ -106,3 +106,149 @@ where
     r.read_exact(&mut buf).await?;
     ciborium::de::from_reader(&buf[..]).map_err(|e| anyhow!("CBOR decode: {e}"))
 }
+
+#[cfg(test)]
+mod kat_tests {
+    //! Known-Answer Tests del wire format relay. Si fallan, peers viejos
+    //! no van a hablar con relays nuevos. Bumpear `PROTOCOL_VERSION` al
+    //! cambiar deliberadamente.
+    use super::*;
+    use tokio::io::duplex;
+
+    fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(v, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn put_request_roundtrip() {
+        let req = RelayRequest::Put {
+            protocol_version: PROTOCOL_VERSION,
+            queue_id: vec![0xab; QUEUE_ID_LEN],
+            blob: b"ciphertext mls payload".to_vec(),
+        };
+        let bytes = cbor(&req);
+        let de: RelayRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
+        match de {
+            RelayRequest::Put {
+                protocol_version,
+                queue_id,
+                blob,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(queue_id, vec![0xab; QUEUE_ID_LEN]);
+                assert_eq!(blob, b"ciphertext mls payload");
+            }
+            other => panic!("esperaba Put, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_request_roundtrip() {
+        let req = RelayRequest::Get {
+            protocol_version: PROTOCOL_VERSION,
+            queue_id: vec![0xff; QUEUE_ID_LEN],
+            since_seq: 42,
+            max_messages: 64,
+        };
+        let bytes = cbor(&req);
+        let de: RelayRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
+        match de {
+            RelayRequest::Get {
+                since_seq,
+                max_messages,
+                ..
+            } => {
+                assert_eq!(since_seq, 42);
+                assert_eq!(max_messages, 64);
+            }
+            other => panic!("esperaba Get, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn putack_response_roundtrip() {
+        let resp = RelayResponse::PutAck { seq: 12345 };
+        let bytes = cbor(&resp);
+        let de: RelayResponse = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert!(matches!(de, RelayResponse::PutAck { seq: 12345 }));
+    }
+
+    #[test]
+    fn getreply_response_roundtrip_with_msgs() {
+        let resp = RelayResponse::GetReply {
+            messages: vec![
+                QueueMessage {
+                    seq: 1,
+                    blob: b"a".to_vec(),
+                },
+                QueueMessage {
+                    seq: 7,
+                    blob: vec![0u8; 1024],
+                },
+            ],
+        };
+        let bytes = cbor(&resp);
+        let de: RelayResponse = ciborium::de::from_reader(&bytes[..]).unwrap();
+        match de {
+            RelayResponse::GetReply { messages } => {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].seq, 1);
+                assert_eq!(messages[1].blob.len(), 1024);
+            }
+            other => panic!("esperaba GetReply, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consume_kp_response_none_vs_some() {
+        let none = RelayResponse::ConsumeKeyPackageReply { key_package: None };
+        let some = RelayResponse::ConsumeKeyPackageReply {
+            key_package: Some(vec![0x42, 0x43, 0x44]),
+        };
+        let bn = cbor(&none);
+        let bs = cbor(&some);
+        assert_ne!(bn, bs);
+        let de_none: RelayResponse = ciborium::de::from_reader(&bn[..]).unwrap();
+        let de_some: RelayResponse = ciborium::de::from_reader(&bs[..]).unwrap();
+        match de_none {
+            RelayResponse::ConsumeKeyPackageReply { key_package: None } => {}
+            other => panic!("esperaba None, llegó {other:?}"),
+        }
+        match de_some {
+            RelayResponse::ConsumeKeyPackageReply {
+                key_package: Some(b),
+            } => assert_eq!(b, vec![0x42, 0x43, 0x44]),
+            other => panic!("esperaba Some, llegó {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_recv_frame_roundtrip() {
+        let (mut a, mut b) = duplex(8 * 1024);
+        let req = RelayRequest::ConsumeKeyPackage {
+            protocol_version: PROTOCOL_VERSION,
+            queue_id: vec![1, 2, 3],
+        };
+        send_frame(&mut a, &req).await.unwrap();
+        let de: RelayRequest = recv_frame(&mut b).await.unwrap();
+        match de {
+            RelayRequest::ConsumeKeyPackage {
+                protocol_version,
+                queue_id,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(queue_id, vec![1, 2, 3]);
+            }
+            other => panic!("esperaba ConsumeKeyPackage, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_one() {
+        // Pin: cualquier cambio de PROTOCOL_VERSION debe ser deliberado y
+        // acompañado de un wire-version bump documentado en README.
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}

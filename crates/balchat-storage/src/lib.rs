@@ -255,6 +255,73 @@ impl Vault {
         Ok(rows)
     }
 
+    /// Versión de `list_contacts` para la UI: para cada contacto incluye un
+    /// preview del último mensaje (kind + body + timestamp) y el número de
+    /// mensajes recibidos posteriores al `last_read_at` del contacto. Los que
+    /// tienen actividad reciente vienen primero (DESC por last_msg.created_at);
+    /// los sin actividad por label asc.
+    pub fn list_contacts_with_preview(&self) -> Result<Vec<ContactPreview>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.label,
+                c.onion_address,
+                c.mls_group_id IS NOT NULL                             AS has_group,
+                (c.relay_onion IS NOT NULL AND c.relay_queue_id IS NOT NULL) AS has_relay,
+                (SELECT m.kind       FROM messages m WHERE m.contact_onion = c.onion_address
+                  ORDER BY m.created_at DESC, m.id DESC LIMIT 1)       AS last_kind,
+                (SELECT m.direction  FROM messages m WHERE m.contact_onion = c.onion_address
+                  ORDER BY m.created_at DESC, m.id DESC LIMIT 1)       AS last_dir,
+                (SELECT m.body       FROM messages m WHERE m.contact_onion = c.onion_address
+                  ORDER BY m.created_at DESC, m.id DESC LIMIT 1)       AS last_body,
+                (SELECT m.created_at FROM messages m WHERE m.contact_onion = c.onion_address
+                  ORDER BY m.created_at DESC, m.id DESC LIMIT 1)       AS last_at,
+                (SELECT COUNT(*) FROM messages m
+                  WHERE m.contact_onion = c.onion_address
+                    AND m.direction = 'received'
+                    AND m.created_at > COALESCE(c.last_read_at, 0))    AS unread
+             FROM contacts c
+             ORDER BY (last_at IS NULL), last_at DESC, c.label",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let has_group: i64 = r.get(2)?;
+                let has_relay: i64 = r.get(3)?;
+                Ok(ContactPreview {
+                    label: r.get(0)?,
+                    onion_address: r.get(1)?,
+                    has_group: has_group != 0,
+                    has_relay: has_relay != 0,
+                    last_kind: r.get(4)?,
+                    last_direction: r.get(5)?,
+                    last_body: r.get(6)?,
+                    last_created_at: r.get(7)?,
+                    unread_count: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Marca como "leídos" todos los mensajes recibidos hasta `now` para un
+    /// contacto (set `last_read_at = now` si es mayor que el actual). La UI
+    /// llama esto cada vez que el usuario selecciona un contacto, así el
+    /// badge de no-leídos se va a 0. Idempotente: si el contacto no existe,
+    /// retorna 0 (no error).
+    pub fn mark_contact_read(&self, onion: &str) -> Result<usize> {
+        let now = unix_now();
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE contacts
+                    SET last_read_at = MAX(COALESCE(last_read_at, 0), ?2)
+                  WHERE onion_address = ?1",
+                params![onion, now],
+            )
+            .with_context(|| format!("mark_contact_read({onion})"))?;
+        Ok(n)
+    }
+
     /// Borra un contacto por su onion address y todos sus mensajes asociados.
     /// Devuelve la cantidad de filas afectadas en `contacts` (0 si no existía,
     /// 1 si lo borró). Los mensajes se borran independientemente — un contacto
@@ -482,6 +549,22 @@ impl Vault {
     }
 }
 
+/// Vista de un contacto enriquecida con un preview del último mensaje, ideal
+/// para renderizar la sidebar del chat. Si el contacto no tiene mensajes,
+/// `last_*` vienen `None` y `unread_count == 0`.
+#[derive(Debug, Clone)]
+pub struct ContactPreview {
+    pub label: String,
+    pub onion_address: String,
+    pub has_group: bool,
+    pub has_relay: bool,
+    pub last_kind: Option<String>,       // 'text' | 'file'
+    pub last_direction: Option<String>,  // 'sent' | 'received'
+    pub last_body: Option<String>,
+    pub last_created_at: Option<i64>,
+    pub unread_count: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Contact {
     pub label: String,
@@ -532,6 +615,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     relay_onion     TEXT,
     relay_queue_id  BLOB,
     expected_pubkey BLOB,
+    last_read_at    INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -584,6 +668,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE contacts ADD COLUMN relay_onion TEXT",
         "ALTER TABLE contacts ADD COLUMN relay_queue_id BLOB",
         "ALTER TABLE contacts ADD COLUMN expected_pubkey BLOB",
+        "ALTER TABLE contacts ADD COLUMN last_read_at INTEGER",
     ];
     for sql in migrations {
         match conn.execute(sql, []) {
@@ -848,6 +933,74 @@ mod tests {
         assert_eq!(last_two.len(), 2);
         assert_eq!(last_two[0].body, "que tal");
         assert_eq!(last_two[1].body, "doc.pdf");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&salt).ok();
+        Ok(())
+    }
+
+    /// `list_contacts_with_preview` devuelve cada contacto enriquecido con
+    /// el último mensaje y el conteo de no-leídos, ordenado por actividad
+    /// descendente. `mark_contact_read` baja el conteo a 0 sin tocar el
+    /// histórico.
+    #[test]
+    fn contacts_preview_and_unread_count() -> Result<()> {
+        let path = tmp_db();
+        let salt = salt_path_for(&path);
+        let v = Vault::open(&path, "pw")?;
+
+        v.upsert_contact(&Contact {
+            label: "alice".into(),
+            onion_address: "a.onion:1234".into(),
+            ..Default::default()
+        })?;
+        v.upsert_contact(&Contact {
+            label: "bob".into(),
+            onion_address: "b.onion:1234".into(),
+            ..Default::default()
+        })?;
+        v.upsert_contact(&Contact {
+            label: "carol".into(),
+            onion_address: "c.onion:1234".into(),
+            ..Default::default()
+        })?;
+
+        v.insert_message("a.onion:1234", "received", "text", "hola alice 1")?;
+        v.insert_message("a.onion:1234", "received", "text", "hola alice 2")?;
+        v.insert_message("a.onion:1234", "sent", "text", "hola alice (yo)")?;
+        v.insert_message("b.onion:1234", "received", "text", "ping bob")?;
+        // Carol sin mensajes.
+
+        let preview = v.list_contacts_with_preview()?;
+        assert_eq!(preview.len(), 3);
+
+        // Los activos primero (alice o bob según created_at; ambos cercanos),
+        // carol al final.
+        assert_eq!(preview[2].label, "carol");
+        assert!(preview[2].last_body.is_none());
+        assert_eq!(preview[2].unread_count, 0);
+
+        let alice = preview.iter().find(|c| c.label == "alice").unwrap();
+        // El último mensaje fue uno SENT, así que el preview es ese, no
+        // cuenta como unread (sólo received cuenta).
+        assert_eq!(alice.last_direction.as_deref(), Some("sent"));
+        assert_eq!(alice.last_body.as_deref(), Some("hola alice (yo)"));
+        assert_eq!(alice.unread_count, 2, "dos received antes del sent → 2 unread");
+
+        let bob = preview.iter().find(|c| c.label == "bob").unwrap();
+        assert_eq!(bob.unread_count, 1);
+
+        // Marcar alice como leída → unread baja a 0; bob sigue con 1.
+        let n = v.mark_contact_read("a.onion:1234")?;
+        assert_eq!(n, 1);
+        let preview2 = v.list_contacts_with_preview()?;
+        let alice2 = preview2.iter().find(|c| c.label == "alice").unwrap();
+        assert_eq!(alice2.unread_count, 0);
+        let bob2 = preview2.iter().find(|c| c.label == "bob").unwrap();
+        assert_eq!(bob2.unread_count, 1, "marcar alice no toca a bob");
+
+        // Idempotente: contacto inexistente.
+        assert_eq!(v.mark_contact_read("does-not-exist:1234")?, 0);
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&salt).ok();

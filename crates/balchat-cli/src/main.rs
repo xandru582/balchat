@@ -13,8 +13,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use balchat_core::conversation::{
-    invite_peer_to_existing_group, process_inbound_blob, push_message_to_group_member, AppPayload,
-    Conversation, HandshakeOutcome, InboundBlob, ResumeResolver, Role,
+    cleanup_chunk_spool, invite_peer_to_existing_group, process_inbound_blob,
+    push_message_to_group_member, record_file_chunk, split_file_into_chunks, AppPayload,
+    ChunkOutcome, Conversation, HandshakeOutcome, InboundBlob, ResumeResolver, Role,
+    FILE_INLINE_THRESHOLD,
 };
 use balchat_core::relay_client::RelayClient;
 use balchat_core::{identity, DataStream, Endpoint, Identity};
@@ -168,12 +170,7 @@ async fn main() -> Result<()> {
                 .to_string_lossy()
                 .to_string();
             println!("[balchat] enviando archivo {filename} ({} bytes)", data.len());
-            run_send_payload(
-                &vault_path,
-                &target,
-                AppPayload::File { filename, data },
-            )
-            .await
+            run_send_file(&vault_path, &target, &filename, data).await
         }
         Cmd::Poll { max } => run_poll(&vault_path, max).await,
         Cmd::Watch {
@@ -398,6 +395,43 @@ async fn run_connect(vault_path: &Path, target: &str, nickname: &str) -> Result<
 
 // ---------- send / poll vía relay ----------
 
+/// Envía un archivo, chunking automático si excede `FILE_INLINE_THRESHOLD`.
+/// Para archivos chicos delega en `run_send_payload(File)`. Para grandes,
+/// genera N `FileChunk` con un mismo `file_id` y los envía secuencialmente
+/// (cada uno reusa el path de send: directo si el peer está online, relay
+/// si no). Si un chunk falla, el reenvío manual de `send-file` los re-genera
+/// con un `file_id` nuevo (no resume incremental por ahora).
+async fn run_send_file(
+    vault_path: &Path,
+    target: &str,
+    filename: &str,
+    data: Vec<u8>,
+) -> Result<()> {
+    if data.len() <= FILE_INLINE_THRESHOLD {
+        return run_send_payload(
+            vault_path,
+            target,
+            AppPayload::File {
+                filename: filename.to_string(),
+                data,
+            },
+        )
+        .await;
+    }
+    let chunks = split_file_into_chunks(filename, &data);
+    let total = chunks.len();
+    println!(
+        "[balchat] archivo grande ({} bytes) → {total} chunks de {} bytes c/u",
+        data.len(),
+        balchat_core::conversation::FILE_CHUNK_SIZE
+    );
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        println!("[balchat] enviando chunk {}/{total}…", i + 1);
+        run_send_payload(vault_path, target, chunk).await?;
+    }
+    Ok(())
+}
+
 async fn run_send_payload(vault_path: &Path, target: &str, payload: AppPayload) -> Result<()> {
     let (vault, identity, base_dir) = open_vault_and_identity(vault_path)?;
 
@@ -554,9 +588,9 @@ async fn run_watch(
     // Publicar pool inicial de KeyPackages para que peers offline puedan iniciar
     // handshake contra mí. Solo si tengo my-relay configurado.
     if identity::get_my_relay(&vault)?.is_some() {
-        match publish_kp_pool(&endpoint, &vault, &identity, 10).await {
+        match identity::publish_keypackage_pool(&endpoint, &vault, &identity, 10).await {
             Ok(pool) => println!("[balchat] pool de KeyPackages en relay = {pool}"),
-            Err(e) => tracing::warn!("publish_kp_pool falló: {e:#}"),
+            Err(e) => tracing::warn!("publish_keypackage_pool falló: {e:#}"),
         }
     }
 
@@ -644,6 +678,51 @@ async fn handle_incoming(
                     Err(e) => tracing::warn!("[de {from}] guardar archivo falló: {e:#}"),
                 }
             }
+            AppPayload::FileChunk {
+                file_id,
+                filename,
+                chunk_idx,
+                total_chunks,
+                total_bytes,
+                data,
+            } => {
+                let spool = partial_inbox(vault);
+                match record_file_chunk(
+                    &spool,
+                    &file_id,
+                    &filename,
+                    chunk_idx,
+                    total_chunks,
+                    total_bytes,
+                    &data,
+                ) {
+                    Ok(ChunkOutcome::Pending(p)) => tracing::info!(
+                        "[de {from}] chunk {}/{} de '{}'",
+                        p.received,
+                        p.total,
+                        p.filename,
+                    ),
+                    Ok(ChunkOutcome::Complete {
+                        filename,
+                        data: full,
+                    }) => {
+                        let inbox_dir = inbox_for(vault, &from);
+                        match save_to_inbox(&inbox_dir, &filename, &full) {
+                            Ok(path) => tracing::info!(
+                                "[de {from}] archivo grande {} ({} bytes) ensamblado → {}",
+                                filename,
+                                full.len(),
+                                path.display()
+                            ),
+                            Err(e) => tracing::warn!(
+                                "[de {from}] guardar archivo grande falló: {e:#}"
+                            ),
+                        }
+                        cleanup_chunk_spool(&spool, &file_id);
+                    }
+                    Err(e) => tracing::warn!("[de {from}] chunk inválido: {e:#}"),
+                }
+            }
         }
         identity::save(vault, identity)?;
     }
@@ -657,6 +736,17 @@ fn inbox_for(vault: &Vault, peer_onion: &str) -> PathBuf {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("inbox").join(sanitize_path_segment(peer_onion))
+}
+
+/// Spool donde guardamos chunks parciales hasta tener todos los del archivo.
+/// Convive con el resto del inbox bajo `<base>/inbox/_partial/<file_id_hex>/`.
+fn partial_inbox(vault: &Vault) -> PathBuf {
+    let base = vault
+        .path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("inbox").join("_partial")
 }
 
 fn save_to_inbox(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf> {
@@ -764,6 +854,66 @@ async fn poll_once(
                     Err(e) => tracing::warn!(
                         seq = msg.seq,
                         "[seq={}] guardar archivo falló: {e:#}",
+                        msg.seq
+                    ),
+                }
+            }
+            Ok(InboundBlob::App {
+                payload:
+                    AppPayload::FileChunk {
+                        file_id,
+                        filename,
+                        chunk_idx,
+                        total_chunks,
+                        total_bytes,
+                        data,
+                    },
+                ..
+            }) => {
+                let spool = partial_inbox(vault);
+                match record_file_chunk(
+                    &spool,
+                    &file_id,
+                    &filename,
+                    chunk_idx,
+                    total_chunks,
+                    total_bytes,
+                    &data,
+                ) {
+                    Ok(ChunkOutcome::Pending(p)) => tracing::info!(
+                        seq = msg.seq,
+                        "[seq={}] chunk {}/{} de '{}' recibido ({} bytes)",
+                        msg.seq,
+                        p.received,
+                        p.total,
+                        p.filename,
+                        data.len()
+                    ),
+                    Ok(ChunkOutcome::Complete {
+                        filename,
+                        data: full,
+                    }) => {
+                        let inbox_dir = inbox_for(vault, "from-relay");
+                        match save_to_inbox(&inbox_dir, &filename, &full) {
+                            Ok(path) => tracing::info!(
+                                seq = msg.seq,
+                                "[seq={}] archivo grande {} ({} bytes) ensamblado → {}",
+                                msg.seq,
+                                filename,
+                                full.len(),
+                                path.display()
+                            ),
+                            Err(e) => tracing::warn!(
+                                seq = msg.seq,
+                                "[seq={}] guardar archivo grande falló: {e:#}",
+                                msg.seq
+                            ),
+                        }
+                        cleanup_chunk_spool(&spool, &file_id);
+                    }
+                    Err(e) => tracing::warn!(
+                        seq = msg.seq,
+                        "[seq={}] chunk inválido: {e:#}",
                         msg.seq
                     ),
                 }
@@ -1057,38 +1207,11 @@ async fn run_send_group(vault_path: &Path, group_label: &str, text: &str) -> Res
     Ok(())
 }
 
-/// Publica `count` KeyPackages frescos en tu relay para que otros peers puedan
-/// iniciar handshake contigo aunque estés offline. Cada KP se consume con un solo
-/// uso por la otra parte; mantener un pool de ~10 cubre invitaciones esporádicas.
-async fn publish_kp_pool(
-    endpoint: &Endpoint,
-    vault: &Vault,
-    identity: &Identity,
-    count: u32,
-) -> Result<u32> {
-    let my_relay = identity::get_my_relay(vault)?
-        .ok_or_else(|| anyhow!("no my-relay configurado (set-my-relay primero)"))?;
-    let my_queue = identity::load_or_create_queue_id(vault)?;
-    let client = RelayClient::new(endpoint);
-
-    let mut last_pool_size = 0u32;
-    for _ in 0..count {
-        let kp_bundle = identity.fresh_key_package()?;
-        let kp_bytes = kp_bundle
-            .key_package()
-            .tls_serialize_detached()
-            .map_err(|e| anyhow!("serializar KeyPackage: {e:?}"))?;
-        last_pool_size = client.put_keypackage(&my_relay, &my_queue, kp_bytes).await?;
-    }
-    identity::save(vault, identity)?;
-    Ok(last_pool_size)
-}
-
 async fn run_publish_kp(vault_path: &Path, count: u32) -> Result<()> {
     let (vault, identity, base_dir) = open_vault_and_identity(vault_path)?;
     println!("[balchat] bootstrap Arti...");
     let endpoint = Endpoint::bootstrap_in(&base_dir).await?;
-    let pool = publish_kp_pool(&endpoint, &vault, &identity, count).await?;
+    let pool = identity::publish_keypackage_pool(&endpoint, &vault, &identity, count).await?;
     println!("[balchat] {count} KeyPackages publicados; pool ahora = {pool}");
     Ok(())
 }

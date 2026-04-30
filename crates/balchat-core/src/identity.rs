@@ -165,6 +165,31 @@ mod tests {
     }
 
     #[test]
+    fn delete_group_removes_state_and_is_idempotent() -> Result<()> {
+        use openmls::group::GroupId;
+        let id = Identity::new("alice")?;
+        let group = create_group(&id)?;
+        let gid_bytes = group.group_id().as_slice().to_vec();
+
+        // Antes: el grupo está en storage.
+        assert!(MlsGroup::load(id.provider.storage(), &GroupId::from_slice(&gid_bytes))
+            .map_err(|e| anyhow::anyhow!("load: {e:?}"))?
+            .is_some());
+
+        delete_group(&id, &gid_bytes)?;
+
+        // Después: el grupo ya no está en storage.
+        assert!(MlsGroup::load(id.provider.storage(), &GroupId::from_slice(&gid_bytes))
+            .map_err(|e| anyhow::anyhow!("load post-delete: {e:?}"))?
+            .is_none());
+
+        // Idempotente: borrar un group_id inexistente no falla.
+        delete_group(&id, &gid_bytes)?;
+        delete_group(&id, b"never-existed")?;
+        Ok(())
+    }
+
+    #[test]
     fn restored_identity_can_create_keypackage() -> Result<()> {
         let original = Identity::new("bob")?;
         let _ = original.fresh_key_package()?;
@@ -248,6 +273,63 @@ pub fn load_group(identity: &Identity, group_id: &[u8]) -> Result<MlsGroup> {
     )
     .map_err(|e| anyhow::anyhow!("MlsGroup::load: {e:?}"))?
     .ok_or_else(|| anyhow::anyhow!("group_id no encontrado en storage MLS"))
+}
+
+/// Publica `count` KeyPackages frescos en el relay propio del usuario, para
+/// que peers offline puedan iniciar handshake (consumir un KP, generar Welcome,
+/// dejarlo en mi queue). Devuelve el `pool_size` reportado por el relay tras
+/// la última publicación.
+///
+/// Requiere `set_my_relay` configurado: si no, falla con un error claro.
+pub async fn publish_keypackage_pool(
+    endpoint: &crate::Endpoint,
+    vault: &balchat_storage::Vault,
+    identity: &Identity,
+    count: u32,
+) -> Result<u32> {
+    use openmls::prelude::tls_codec::Serialize as _;
+
+    let my_relay = get_my_relay(vault)?
+        .ok_or_else(|| anyhow::anyhow!("no my-relay configurado (`set_my_relay` primero)"))?;
+    let my_queue = load_or_create_queue_id(vault)?;
+    let client = crate::relay_client::RelayClient::new(endpoint);
+
+    let mut last_pool_size = 0u32;
+    for _ in 0..count {
+        let kp_bundle = identity.fresh_key_package()?;
+        let kp_bytes = kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|e| anyhow::anyhow!("serializar KeyPackage: {e:?}"))?;
+        last_pool_size = client
+            .put_keypackage(&my_relay, &my_queue, kp_bytes)
+            .await?;
+    }
+    save(vault, identity)?;
+    Ok(last_pool_size)
+}
+
+/// Borra el state MLS de un grupo del storage del provider. Útil cuando el
+/// caller (CLI/Tauri) elimina un contacto o un grupo: si no llamamos esto,
+/// el state queda huérfano en el `MemoryStorage` y se sigue persistiendo en
+/// el vault al `identity::save`.
+///
+/// Idempotente: si el group_id no existe en el storage, retorna Ok(()).
+/// Recuerda llamar `identity::save(vault, identity)` después para que el
+/// vault refleje el nuevo dump del storage.
+pub fn delete_group(identity: &Identity, group_id: &[u8]) -> Result<()> {
+    use openmls::group::GroupId;
+    let gid = GroupId::from_slice(group_id);
+    let mut group = match MlsGroup::load(identity.provider.storage(), &gid)
+        .map_err(|e| anyhow::anyhow!("MlsGroup::load (delete): {e:?}"))?
+    {
+        Some(g) => g,
+        None => return Ok(()), // ya no existe, idempotente
+    };
+    group
+        .delete(identity.provider.storage())
+        .map_err(|e| anyhow::anyhow!("MlsGroup::delete: {e:?}"))?;
+    Ok(())
 }
 
 /// Procesa un blob que se asume ser un MLS Welcome — joinea el grupo y persiste

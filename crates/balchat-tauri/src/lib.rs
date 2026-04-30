@@ -9,8 +9,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use balchat_core::conversation::{
-    process_inbound_blob, AppPayload, Conversation, HandshakeOutcome, InboundBlob, ResumeResolver,
-    Role,
+    cleanup_chunk_spool, process_inbound_blob, record_file_chunk, split_file_into_chunks,
+    AppPayload, ChunkOutcome, Conversation, HandshakeOutcome, InboundBlob, ResumeResolver, Role,
+    FILE_INLINE_THRESHOLD,
 };
 use balchat_core::relay_client::RelayClient;
 use balchat_core::{identity, DataStream, Endpoint, HostHandle, Identity};
@@ -29,6 +30,7 @@ use tokio::sync::Mutex;
 const VIRTUAL_PORT: u16 = 1234;
 const NICKNAME: &str = "balchat";
 const VAULT_KEY_MY_ONION: &str = "my_onion.v1";
+const VAULT_KEY_AUTO_LOCK_MINUTES: &str = "auto_lock_minutes.v1";
 
 // -------- AppState compartido --------
 
@@ -76,6 +78,23 @@ struct ContactDto {
     onion_address: String,
     has_group: bool,
     has_relay: bool,
+    /// Preview del último mensaje (text/file body o filename). `None` si el
+    /// contacto todavía no tiene historial.
+    last_body: Option<String>,
+    /// 'text' | 'file' del último mensaje, o `None`.
+    last_kind: Option<String>,
+    /// 'sent' | 'received' del último mensaje.
+    last_direction: Option<String>,
+    /// Unix epoch (seg) del último mensaje, para que la UI ordene/muestre fecha.
+    last_created_at: Option<i64>,
+    /// Mensajes 'received' posteriores al `last_read_at`. La UI lo dibuja como
+    /// badge azul con el número.
+    unread_count: i64,
+}
+
+#[derive(Serialize, Clone)]
+struct SettingsDto {
+    auto_lock_minutes: u32,
 }
 
 #[derive(Serialize, Clone)]
@@ -226,16 +245,174 @@ async fn lock_vault(state: State<'_, AppState>) -> Result<(), String> {
 async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactDto>, String> {
     let inner = state.inner.lock().await;
     let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
-    let contacts = vault.list_contacts().map_err(stringify)?;
-    Ok(contacts
+    let preview = vault.list_contacts_with_preview().map_err(stringify)?;
+    Ok(preview
         .into_iter()
         .map(|c| ContactDto {
             label: c.label,
             onion_address: c.onion_address,
-            has_group: c.mls_group_id.is_some(),
-            has_relay: c.relay_onion.is_some() && c.relay_queue_id.is_some(),
+            has_group: c.has_group,
+            has_relay: c.has_relay,
+            last_body: c.last_body,
+            last_kind: c.last_kind,
+            last_direction: c.last_direction,
+            last_created_at: c.last_created_at,
+            unread_count: c.unread_count,
         })
         .collect())
+}
+
+/// Marca todos los mensajes recibidos hasta ahora como leídos para el contacto.
+/// La UI lo invoca cuando el usuario selecciona un contacto, así el badge de
+/// no-leídos baja a 0.
+#[tauri::command]
+async fn mark_contact_read_cmd(
+    peer: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let normalized = if peer.contains(':') {
+        peer
+    } else {
+        format!("{peer}:{VIRTUAL_PORT}")
+    };
+    vault.mark_contact_read(&normalized).map_err(stringify)?;
+    Ok(())
+}
+
+/// Persiste el relay propio (donde recibo blobs offline). Equivale al CLI
+/// `balchat set-my-relay`. La UI lo expone en el panel de Settings; reemplaza
+/// el valor actual.
+#[tauri::command]
+async fn set_my_relay_cmd(
+    relay_onion: String,
+    state: State<'_, AppState>,
+) -> Result<MyId, String> {
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let trimmed = relay_onion.trim();
+    if trimmed.is_empty() {
+        return Err("relay onion no puede estar vacío".into());
+    }
+    identity::set_my_relay(vault, trimmed).map_err(stringify)?;
+    let queue = identity::load_or_create_queue_id(vault).map_err(stringify)?;
+    let onion = vault
+        .kv_get(VAULT_KEY_MY_ONION)
+        .map_err(stringify)?
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    Ok(MyId {
+        onion,
+        queue: hex_encode(&queue),
+        relay: trimmed.to_string(),
+    })
+}
+
+/// Publica un pool de N KeyPackages en mi relay (para que peers offline puedan
+/// invitarme a grupos via Welcome offline). Reusa el helper de balchat-core.
+/// Requiere `set_my_relay_cmd` previo y daemon arrancado (necesita `Endpoint`).
+#[tauri::command]
+async fn publish_kp_cmd(
+    count: u32,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    if count == 0 || count > 100 {
+        return Err("count fuera de rango razonable (1..=100)".into());
+    }
+    let (vault, identity, endpoint) = {
+        let inner = state.inner.lock().await;
+        let v = inner.vault.as_ref().ok_or("vault no abierto")?.clone();
+        let i = inner.identity.as_ref().ok_or("identidad no cargada")?.clone();
+        let e = inner
+            .endpoint
+            .as_ref()
+            .ok_or("daemon no arrancado: necesita estar corriendo para publicar al relay")?
+            .clone();
+        (v, i, e)
+    };
+    let pool = identity::publish_keypackage_pool(&endpoint, &vault, &identity, count)
+        .await
+        .map_err(stringify)?;
+    Ok(pool)
+}
+
+/// Lee la configuración persistida en el vault. Por ahora solo `auto_lock_minutes`,
+/// con default 5 si nunca se setó.
+#[tauri::command]
+async fn get_settings_cmd(state: State<'_, AppState>) -> Result<SettingsDto, String> {
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let auto_lock_minutes = vault
+        .kv_get(VAULT_KEY_AUTO_LOCK_MINUTES)
+        .map_err(stringify)?
+        .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.parse::<u32>().ok()))
+        .unwrap_or(5);
+    Ok(SettingsDto { auto_lock_minutes })
+}
+
+/// Persiste la configuración. `auto_lock_minutes == 0` desactiva el auto-lock
+/// (la UI no programará el setTimeout). Acotamos a [0, 1440] (24 h max) para
+/// evitar valores absurdos.
+#[tauri::command]
+async fn set_settings_cmd(
+    auto_lock_minutes: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if auto_lock_minutes > 1440 {
+        return Err("auto_lock_minutes fuera de rango (0..=1440)".into());
+    }
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    vault
+        .kv_set(
+            VAULT_KEY_AUTO_LOCK_MINUTES,
+            auto_lock_minutes.to_string().as_bytes(),
+        )
+        .map_err(stringify)?;
+    Ok(())
+}
+
+/// Exporta el vault SQLCipher (.db) y su salt al directorio destino. El archivo
+/// destino conserva su passphrase original — para "rotar" la passphrase habría
+/// que reabrir + volver a cifrar, fuera de scope para este snapshot.
+///
+/// `target_dir` es un directorio existente; copiamos `vault.db` y `vault.db.salt`
+/// con timestamp en el nombre (`vault-YYYYMMDD-HHMMSS.db`). Devuelve la ruta
+/// final del .db copiado para que la UI la muestre / la abra en el file manager.
+#[tauri::command]
+async fn export_vault_cmd(
+    target_dir: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let src = vault.path().to_path_buf();
+    let dir = std::path::PathBuf::from(target_dir.trim());
+    if !dir.is_dir() {
+        return Err(format!("target_dir no es un directorio: {}", dir.display()));
+    }
+    let stamp = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // No queremos pull `chrono` solo para esto; un epoch es suficiente como id.
+        format!("{now}")
+    };
+    let dst_db = dir.join(format!("vault-{stamp}.db"));
+    let dst_salt = dir.join(format!("vault-{stamp}.db.salt"));
+
+    std::fs::copy(&src, &dst_db).map_err(|e| format!("copiar db: {e}"))?;
+    let src_salt = {
+        let mut s = src.as_os_str().to_owned();
+        s.push(".salt");
+        std::path::PathBuf::from(s)
+    };
+    if src_salt.exists() {
+        std::fs::copy(&src_salt, &dst_salt).map_err(|e| format!("copiar salt: {e}"))?;
+    }
+    Ok(dst_db.display().to_string())
 }
 
 /// Persiste un contacto en el vault. Equivalente al CLI `balchat add-contact`.
@@ -316,6 +493,11 @@ async fn add_contact_cmd(
 
 /// Borra un contacto del vault y todos sus mensajes asociados. `peer` se
 /// normaliza al puerto virtual igual que en los demás comandos.
+///
+/// Si el contacto tenía un grupo MLS 1:1 asociado, también borra el state
+/// MLS del provider (cierra la fuga menor de storage que documentaba el README).
+/// El borrado MLS es idempotente: si el group_id ya no estaba en storage, no
+/// falla.
 #[tauri::command]
 async fn delete_contact_cmd(
     peer: String,
@@ -323,14 +505,27 @@ async fn delete_contact_cmd(
 ) -> Result<(), String> {
     let inner = state.inner.lock().await;
     let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let identity = inner.identity.as_ref().ok_or("identidad no cargada")?;
     let normalized = if peer.contains(':') {
         peer
     } else {
         format!("{peer}:{VIRTUAL_PORT}")
     };
+    // Lookup primero para conocer el mls_group_id antes de borrar la fila.
+    let existing_group_id = vault
+        .get_contact_by_onion(&normalized)
+        .map_err(stringify)?
+        .and_then(|c| c.mls_group_id);
     vault
         .delete_contact_and_messages(&normalized)
         .map_err(stringify)?;
+    if let Some(gid) = existing_group_id {
+        if let Err(e) = identity::delete_group(identity, &gid) {
+            tracing::warn!("delete_group({}): {e:#}", hex_encode(&gid));
+        } else if let Err(e) = identity::save(vault, identity) {
+            tracing::warn!("save tras delete_group falló: {e:#}");
+        }
+    }
     Ok(())
 }
 
@@ -496,20 +691,27 @@ async fn send_file_path(
         .ok_or("path sin filename")?;
     let data = std::fs::read(&path_buf)
         .map_err(|e| format!("leer {}: {e}", path_buf.display()))?;
-    if data.len() > 14 * 1024 * 1024 {
-        return Err(format!(
-            "archivo demasiado grande ({} MB; límite ~14 MB para un solo MLS msg)",
-            data.len() / 1024 / 1024
-        ));
-    }
 
-    let payload = AppPayload::File {
-        filename: filename.clone(),
-        data,
-    };
-    send_with_fallback(&endpoint, &vault, &identity, &normalized, &contact, &payload)
-        .await
-        .map_err(stringify)?;
+    if data.len() <= FILE_INLINE_THRESHOLD {
+        let payload = AppPayload::File {
+            filename: filename.clone(),
+            data,
+        };
+        send_with_fallback(&endpoint, &vault, &identity, &normalized, &contact, &payload)
+            .await
+            .map_err(stringify)?;
+    } else {
+        // Archivo grande: cortar en chunks y enviar uno por uno. Cada chunk va
+        // por el mismo path send → directo si peer online, relay si offline.
+        let chunks = split_file_into_chunks(&filename, &data);
+        let total = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            tracing::info!("enviando chunk {}/{} de {}", i + 1, total, filename);
+            send_with_fallback(&endpoint, &vault, &identity, &normalized, &contact, &chunk)
+                .await
+                .map_err(stringify)?;
+        }
+    }
     if let Err(e) = vault.insert_message(&normalized, "sent", "file", &filename) {
         tracing::warn!("insert_message (sent file) falló: {e:#}");
     }
@@ -765,6 +967,86 @@ async fn poll_and_emit(
                             &format!("archivo recibido: {filename} ({} bytes)", data.len()),
                         );
                     }
+                    AppPayload::FileChunk {
+                        file_id,
+                        filename,
+                        chunk_idx,
+                        total_chunks,
+                        total_bytes,
+                        data,
+                    } => {
+                        let spool = partial_inbox(vault);
+                        match record_file_chunk(
+                            &spool,
+                            &file_id,
+                            &filename,
+                            chunk_idx,
+                            total_chunks,
+                            total_bytes,
+                            &data,
+                        ) {
+                            Ok(ChunkOutcome::Pending(p)) => {
+                                let _ = app.emit(
+                                    "balchat://message",
+                                    LogEntry::Info {
+                                        text: format!(
+                                            "{} chunk {}/{} ({} bytes)",
+                                            p.filename,
+                                            p.received,
+                                            p.total,
+                                            data.len()
+                                        ),
+                                    },
+                                );
+                            }
+                            Ok(ChunkOutcome::Complete {
+                                filename,
+                                data: full,
+                            }) => {
+                                let inbox_dir = inbox_for(vault, &from_id);
+                                let saved = save_to_inbox(&inbox_dir, &filename, &full);
+                                if let Err(e) = vault.insert_message(
+                                    &from_id,
+                                    "received",
+                                    "file",
+                                    &filename,
+                                ) {
+                                    tracing::warn!("insert_message (chunked file) falló: {e:#}");
+                                }
+                                let path_str = match saved {
+                                    Ok(p) => p.display().to_string(),
+                                    Err(e) => {
+                                        tracing::warn!("save_to_inbox: {e:#}");
+                                        format!("(no se pudo guardar: {e})")
+                                    }
+                                };
+                                let _ = app.emit(
+                                    "balchat://message",
+                                    LogEntry::Info {
+                                        text: format!(
+                                            "archivo grande {filename} ({} bytes) → {path_str}",
+                                            full.len()
+                                        ),
+                                    },
+                                );
+                                let display = from_label.clone().unwrap_or_else(|| "balchat".to_string());
+                                send_system_notification(
+                                    app,
+                                    &display,
+                                    &format!("archivo grande {filename} ({} bytes)", full.len()),
+                                );
+                                cleanup_chunk_spool(&spool, &file_id);
+                            }
+                            Err(e) => {
+                                let _ = app.emit(
+                                    "balchat://message",
+                                    LogEntry::Error {
+                                        text: format!("chunk inválido: {e:#}"),
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
                 identity::save(vault, identity)?;
             }
@@ -850,6 +1132,79 @@ async fn handle_incoming(
                     &format!("archivo {filename} ({} bytes)", data.len()),
                 );
             }
+            AppPayload::FileChunk {
+                file_id,
+                filename,
+                chunk_idx,
+                total_chunks,
+                total_bytes,
+                data,
+            } => {
+                let spool = partial_inbox(vault);
+                match record_file_chunk(
+                    &spool,
+                    &file_id,
+                    &filename,
+                    chunk_idx,
+                    total_chunks,
+                    total_bytes,
+                    &data,
+                ) {
+                    Ok(ChunkOutcome::Pending(p)) => {
+                        let _ = app.emit(
+                            "balchat://message",
+                            LogEntry::Info {
+                                text: format!(
+                                    "[de {from}] chunk {}/{} de '{}'",
+                                    p.received, p.total, p.filename
+                                ),
+                            },
+                        );
+                    }
+                    Ok(ChunkOutcome::Complete {
+                        filename,
+                        data: full,
+                    }) => {
+                        let inbox_dir = inbox_for(vault, &from);
+                        let saved = save_to_inbox(&inbox_dir, &filename, &full);
+                        if let Err(e) =
+                            vault.insert_message(&from, "received", "file", &filename)
+                        {
+                            tracing::warn!("insert_message (live chunked) falló: {e:#}");
+                        }
+                        let path_str = match saved {
+                            Ok(p) => p.display().to_string(),
+                            Err(e) => {
+                                tracing::warn!("save_to_inbox: {e:#}");
+                                format!("(no se pudo guardar: {e})")
+                            }
+                        };
+                        let _ = app.emit(
+                            "balchat://message",
+                            LogEntry::Info {
+                                text: format!(
+                                    "[de {from}] archivo grande {filename} ({} bytes) → {path_str}",
+                                    full.len()
+                                ),
+                            },
+                        );
+                        send_system_notification(
+                            app,
+                            &from,
+                            &format!("archivo grande {filename} ({} bytes)", full.len()),
+                        );
+                        cleanup_chunk_spool(&spool, &file_id);
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "balchat://message",
+                            LogEntry::Error {
+                                text: format!("chunk inválido: {e:#}"),
+                            },
+                        );
+                    }
+                }
+            }
         }
         identity::save(vault, identity)?;
     }
@@ -874,6 +1229,72 @@ fn send_system_notification(app: &AppHandle, title: &str, body: &str) {
     if let Err(e) = res {
         tracing::warn!("notification.show falló: {e:#}");
     }
+}
+
+/// Devuelve el directorio donde guardamos chunks parciales mientras llegan
+/// los blobs de un archivo grande. Vive bajo `<base>/inbox/_partial/` y se
+/// auto-crea cuando el primer chunk llega.
+fn partial_inbox(vault: &Vault) -> std::path::PathBuf {
+    let base = vault
+        .path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("inbox").join("_partial")
+}
+
+/// Inbox final donde se persiste un archivo ya ensamblado. Lo identifica por
+/// `peer_key` (puede ser onion, "from-relay" o etiqueta sintética).
+fn inbox_for(vault: &Vault, peer_key: &str) -> std::path::PathBuf {
+    let base = vault
+        .path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let safe: String = peer_key
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    base.join("inbox").join(safe)
+}
+
+/// Guarda `data` en `dir/<safe(filename)>` (con sufijo numérico si ya existía).
+fn save_to_inbox(
+    dir: &std::path::Path,
+    filename: &str,
+    data: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut path = dir.join(&safe);
+    let mut i = 1u32;
+    while path.exists() {
+        path = dir.join(format!("{safe}.{i}"));
+        i += 1;
+        if i > 1000 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "demasiados archivos con nombre conflictivo",
+            ));
+        }
+    }
+    std::fs::write(&path, data)?;
+    Ok(path)
 }
 
 /// Busca un contacto por `mls_group_id`. Útil para resolver mensajes recibidos
@@ -969,6 +1390,12 @@ pub fn run() {
             add_contact_cmd,
             delete_contact_cmd,
             list_messages_cmd,
+            mark_contact_read_cmd,
+            set_my_relay_cmd,
+            publish_kp_cmd,
+            get_settings_cmd,
+            set_settings_cmd,
+            export_vault_cmd,
             start_daemon,
             send_text,
             send_file_path,

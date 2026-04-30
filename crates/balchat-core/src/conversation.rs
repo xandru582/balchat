@@ -26,9 +26,25 @@ use crate::wire::{recv_frame, send_frame, Frame, PROTOCOL_VERSION};
 pub enum AppPayload {
     /// Mensaje de texto UTF-8.
     Text(String),
-    /// Archivo entero in-line (límite real ~15 MB tras overhead MLS).
+    /// Archivo entero in-line (límite real ~14 MiB tras overhead MLS).
+    /// Para archivos más grandes, ver [`AppPayload::FileChunk`].
     File {
         filename: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// Un chunk de un archivo grande. Se identifican por `file_id` (16 bytes
+    /// random generados por el sender); cuando el receiver tiene todos los
+    /// `total_chunks`, los concatena en orden de `chunk_idx` y obtiene el
+    /// archivo final. La metadata (filename / total_chunks / total_bytes) se
+    /// repite en cada chunk para que el orden de llegada no importe.
+    FileChunk {
+        #[serde(with = "serde_bytes")]
+        file_id: Vec<u8>,
+        filename: String,
+        total_chunks: u32,
+        chunk_idx: u32,
+        total_bytes: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -38,6 +54,174 @@ impl AppPayload {
     pub fn text(s: impl Into<String>) -> Self {
         AppPayload::Text(s.into())
     }
+}
+
+/// Tamaño de chunk en bytes (8 MiB). MLS Application messages tienen overhead
+/// (~few KiB) sobre un PrivateMessage; con 8 MiB de payload neto cabemos cómodos
+/// dentro del ~14 MiB efectivo del frame.
+pub const FILE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Threshold a partir del cual conviene cortar en chunks. Por debajo de esto
+/// usamos `AppPayload::File` (un solo mensaje) porque es más eficiente.
+pub const FILE_INLINE_THRESHOLD: usize = 12 * 1024 * 1024;
+
+/// Genera un `file_id` aleatorio (16 bytes) y parte `data` en chunks de
+/// `FILE_CHUNK_SIZE` bytes. Cada chunk lleva la misma metadata para que el
+/// receiver pueda reensamblar incluso si los chunks llegan desordenados.
+pub fn split_file_into_chunks(filename: &str, data: &[u8]) -> Vec<AppPayload> {
+    use rand::RngCore;
+    let mut file_id = vec![0u8; 16];
+    rand::thread_rng().fill_bytes(&mut file_id);
+    let total_bytes = data.len() as u64;
+    let total_chunks =
+        ((data.len() + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE).max(1) as u32;
+
+    data.chunks(FILE_CHUNK_SIZE)
+        .enumerate()
+        .map(|(i, slice)| AppPayload::FileChunk {
+            file_id: file_id.clone(),
+            filename: filename.to_string(),
+            total_chunks,
+            chunk_idx: i as u32,
+            total_bytes,
+            data: slice.to_vec(),
+        })
+        .collect()
+}
+
+/// Estado del reensamblaje de un archivo grande. Devuelto por
+/// [`record_file_chunk`] cuando aún faltan chunks.
+#[derive(Debug, Clone)]
+pub struct ChunkProgress {
+    pub filename: String,
+    pub received: u32,
+    pub total: u32,
+    pub total_bytes: u64,
+}
+
+/// Resultado de procesar un `FileChunk`. O bien queda incompleto y devolvemos
+/// progreso (`Pending`), o se completó y entregamos el archivo ensamblado
+/// (`Complete`). El caller decide cómo guardarlo.
+#[derive(Debug)]
+pub enum ChunkOutcome {
+    Pending(ChunkProgress),
+    Complete {
+        filename: String,
+        data: Vec<u8>,
+    },
+}
+
+/// Persiste el chunk en `spool_dir` (si todavía no existe), y retorna `Complete`
+/// cuando ya tenemos todos los chunks (concatenados en orden + metadata
+/// validada). Idempotente: re-recibir el mismo chunk no rompe nada.
+///
+/// Layout en disco:
+/// ```text
+/// <spool_dir>/<file_id_hex>/meta.cbor          -> { filename, total_chunks, total_bytes }
+/// <spool_dir>/<file_id_hex>/chunk-<idx>.bin    -> bytes del chunk
+/// ```
+///
+/// Una vez completo, el caller debe borrar el directorio parcial — esta función
+/// no lo hace para evitar borrar antes de que el caller persista el archivo.
+pub fn record_file_chunk(
+    spool_dir: &std::path::Path,
+    file_id: &[u8],
+    filename: &str,
+    chunk_idx: u32,
+    total_chunks: u32,
+    total_bytes: u64,
+    chunk_data: &[u8],
+) -> Result<ChunkOutcome> {
+    if chunk_idx >= total_chunks {
+        return Err(anyhow!(
+            "chunk_idx {chunk_idx} fuera de rango (total={total_chunks})"
+        ));
+    }
+    let id_hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = spool_dir.join(&id_hex);
+    std::fs::create_dir_all(&dir).with_context(|| format!("crear {}", dir.display()))?;
+
+    // Persistir meta una sola vez; si ya existe, validamos consistencia.
+    let meta_path = dir.join("meta.cbor");
+    if !meta_path.exists() {
+        let meta = ChunkMeta {
+            filename: filename.to_string(),
+            total_chunks,
+            total_bytes,
+        };
+        let mut buf = Vec::with_capacity(64);
+        ciborium::ser::into_writer(&meta, &mut buf)
+            .map_err(|e| anyhow!("CBOR meta: {e}"))?;
+        std::fs::write(&meta_path, &buf).with_context(|| format!("escribir {}", meta_path.display()))?;
+    } else {
+        // Validar que no es un atacante reusando file_id con filename distinto.
+        let bytes = std::fs::read(&meta_path)?;
+        let m: ChunkMeta = ciborium::de::from_reader(&bytes[..])
+            .map_err(|e| anyhow!("leer meta CBOR: {e}"))?;
+        if m.filename != filename || m.total_chunks != total_chunks || m.total_bytes != total_bytes {
+            return Err(anyhow!(
+                "metadata de chunk inconsistente con la ya recibida — file_id reusado con datos distintos"
+            ));
+        }
+    }
+
+    let chunk_path = dir.join(format!("chunk-{chunk_idx:08}.bin"));
+    if !chunk_path.exists() {
+        std::fs::write(&chunk_path, chunk_data)
+            .with_context(|| format!("escribir {}", chunk_path.display()))?;
+    }
+
+    let mut received: u32 = 0;
+    for i in 0..total_chunks {
+        if dir.join(format!("chunk-{i:08}.bin")).exists() {
+            received += 1;
+        }
+    }
+    if received < total_chunks {
+        return Ok(ChunkOutcome::Pending(ChunkProgress {
+            filename: filename.to_string(),
+            received,
+            total: total_chunks,
+            total_bytes,
+        }));
+    }
+
+    // Concat en orden. Nota: en archivos muy grandes esto carga todo a RAM —
+    // para optimizar más tarde podemos streamear directo al destino.
+    let mut data = Vec::with_capacity(total_bytes as usize);
+    for i in 0..total_chunks {
+        let p = dir.join(format!("chunk-{i:08}.bin"));
+        let bytes = std::fs::read(&p).with_context(|| format!("leer {}", p.display()))?;
+        data.extend_from_slice(&bytes);
+    }
+    if data.len() as u64 != total_bytes {
+        return Err(anyhow!(
+            "tamaño concatenado {} != total_bytes declarado {}",
+            data.len(),
+            total_bytes
+        ));
+    }
+
+    Ok(ChunkOutcome::Complete {
+        filename: filename.to_string(),
+        data,
+    })
+}
+
+/// Borra el directorio parcial de un file_id ya ensamblado. Idempotente.
+pub fn cleanup_chunk_spool(spool_dir: &std::path::Path, file_id: &[u8]) {
+    let id_hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = spool_dir.join(&id_hex);
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChunkMeta {
+    filename: String,
+    total_chunks: u32,
+    total_bytes: u64,
 }
 
 /// Indica quién inició la conexión TCP. No afecta a MLS — solo determina el orden
@@ -311,6 +495,12 @@ where
                     tracing::warn!(
                         "recv_text: descartando AppPayload::File '{filename}' ({} bytes)",
                         data.len()
+                    );
+                    continue;
+                }
+                Some(AppPayload::FileChunk { filename, chunk_idx, total_chunks, .. }) => {
+                    tracing::warn!(
+                        "recv_text: descartando FileChunk '{filename}' ({chunk_idx}/{total_chunks})"
                     );
                     continue;
                 }
@@ -621,6 +811,148 @@ mod tests {
             }
             other => panic!("esperaba InboundBlob::App(Text), llegó {other:?}"),
         }
+        Ok(())
+    }
+
+    /// KAT del wire de AppPayload: pequeños vectores que validan que el CBOR
+    /// del payload de aplicación no cambia entre versiones. Si esto rompe,
+    /// peers viejos no descifran payloads nuevos (o al revés). Bumpear el
+    /// protocolo conscientemente y actualizar.
+    #[test]
+    fn app_payload_text_canonical_cbor() {
+        let p = AppPayload::Text("ok".into());
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&p, &mut buf).unwrap();
+        // ciborium externally-tagged: { "Text": "ok" }
+        // 0xa1 = map(1), 0x64 = text(4) "Text", 0x62 = text(2) "ok"
+        assert_eq!(
+            buf,
+            [0xa1, 0x64, b'T', b'e', b'x', b't', 0x62, b'o', b'k'],
+            "CBOR de AppPayload::Text('ok') no es el esperado"
+        );
+        // Roundtrip:
+        let de: AppPayload = ciborium::de::from_reader(&buf[..]).unwrap();
+        match de {
+            AppPayload::Text(t) => assert_eq!(t, "ok"),
+            other => panic!("esperaba Text, llegó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_payload_filechunk_roundtrip() {
+        let p = AppPayload::FileChunk {
+            file_id: vec![0x11, 0x22, 0x33, 0x44],
+            filename: "archivo.bin".into(),
+            total_chunks: 3,
+            chunk_idx: 1,
+            total_bytes: 12345,
+            data: b"chunk-2-payload".to_vec(),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&p, &mut buf).unwrap();
+        let de: AppPayload = ciborium::de::from_reader(&buf[..]).unwrap();
+        match de {
+            AppPayload::FileChunk {
+                file_id,
+                filename,
+                total_chunks,
+                chunk_idx,
+                total_bytes,
+                data,
+            } => {
+                assert_eq!(file_id, vec![0x11, 0x22, 0x33, 0x44]);
+                assert_eq!(filename, "archivo.bin");
+                assert_eq!(total_chunks, 3);
+                assert_eq!(chunk_idx, 1);
+                assert_eq!(total_bytes, 12345);
+                assert_eq!(data, b"chunk-2-payload");
+            }
+            other => panic!("esperaba FileChunk, llegó {other:?}"),
+        }
+    }
+
+    /// Chunking de archivos > FILE_INLINE_THRESHOLD: split + record_file_chunk
+    /// reconstruye los bytes originales, incluso si llegan en orden invertido.
+    #[test]
+    fn chunked_file_roundtrip_out_of_order() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "balchat-chunk-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp)?;
+
+        // Generar un payload de 25 MiB para forzar 4 chunks de 8 MiB.
+        let big: Vec<u8> = (0..25 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
+        let chunks = split_file_into_chunks("video.mp4", &big);
+        assert_eq!(chunks.len(), 4, "25 MiB / 8 MiB ⌈⌉ = 4 chunks");
+
+        // Enviar en orden invertido para asegurarnos que el reensamblaje no
+        // depende del orden de llegada.
+        let mut completed: Option<Vec<u8>> = None;
+        for chunk in chunks.iter().rev() {
+            if let AppPayload::FileChunk {
+                file_id,
+                filename,
+                chunk_idx,
+                total_chunks,
+                total_bytes,
+                data,
+            } = chunk
+            {
+                let outcome = record_file_chunk(
+                    &tmp,
+                    file_id,
+                    filename,
+                    *chunk_idx,
+                    *total_chunks,
+                    *total_bytes,
+                    data,
+                )?;
+                match outcome {
+                    ChunkOutcome::Pending(p) => {
+                        assert!(p.received < p.total);
+                    }
+                    ChunkOutcome::Complete { filename, data } => {
+                        assert_eq!(filename, "video.mp4");
+                        assert_eq!(data.len(), big.len());
+                        assert_eq!(data, big);
+                        cleanup_chunk_spool(&tmp, file_id);
+                        completed = Some(data);
+                    }
+                }
+            }
+        }
+        assert!(completed.is_some(), "el último chunk debió completar");
+
+        // Idempotencia: re-enviar el mismo chunk no rompe.
+        if let AppPayload::FileChunk {
+            file_id,
+            filename,
+            chunk_idx,
+            total_chunks,
+            total_bytes,
+            data,
+        } = &chunks[0]
+        {
+            // Como ya hicimos cleanup, el primer chunk crea el spool de nuevo
+            // y queda Pending — eso valida la idempotencia del path "vuelve a
+            // empezar" sin romper la API.
+            let outcome = record_file_chunk(
+                &tmp,
+                file_id,
+                filename,
+                *chunk_idx,
+                *total_chunks,
+                *total_bytes,
+                data,
+            )?;
+            assert!(matches!(outcome, ChunkOutcome::Pending(_)));
+            cleanup_chunk_spool(&tmp, file_id);
+        }
+        std::fs::remove_dir_all(&tmp).ok();
         Ok(())
     }
 
