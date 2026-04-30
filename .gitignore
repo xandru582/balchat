@@ -1,0 +1,45 @@
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+.envrc.local
+
+# Datos locales (vaults, relay state, etc.)
+data/
+*.db
+*.db.salt
+
+# Frontend Svelte
+crates/balchat-tauri/ui/node_modules/
+crates/balchat-tauri/ui/dist/
+
+# Tauri Android: gen/ tiene fuente generada (manifests, kotlin) que sí
+# queremos commitear, pero el build/ de gradle y los jniLibs symlinks no.
+crates/balchat-tauri/gen/android/.gradle/
+crates/balchat-tauri/gen/android/build/
+crates/balchat-tauri/gen/android/app/build/
+crates/balchat-tauri/gen/android/app/.cxx/
+crates/balchat-tauri/gen/android/app/src/main/jniLibs/
+crates/balchat-tauri/gen/android/app/src/main/assets/
+crates/balchat-tauri/gen/android/local.properties
+
+# APKs / firmas / secretos
+*.apk
+*.aab
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# Tauri schemas generados al build
+crates/balchat-tauri/gen/schemas/
+
+# Claude Code local state
+.claude/

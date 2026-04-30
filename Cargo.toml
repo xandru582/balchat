@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spike-mls",
+    "crates/spike-tor",
+    "crates/balchat-storage",
+    "crates/balchat-relay-proto",
+    "crates/balchat-relay",
+    "crates/balchat-core",
+    "crates/balchat-cli",
+    "crates/balchat-tauri",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["Alejandro <xandru2222@gmail.com>"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+tokio = { version = "1.52.1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+
+arti-client = { version = "0.41", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client"] }
+tor-hsservice = { version = "0.41", default-features = false }
+tor-rtcompat = { version = "0.41", default-features = false, features = ["tokio", "rustls"] }
+tor-cell = "0.41"
+safelog = "0.8"
+
+openmls = "0.8"
+openmls_traits = "0.5"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+balchat-core = { path = "crates/balchat-core" }
+balchat-storage = { path = "crates/balchat-storage" }
+balchat-relay-proto = { path = "crates/balchat-relay-proto" }
+
+tauri = { version = "2", default-features = false, features = ["wry"] }
+tauri-build = { version = "2", default-features = false }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde_json = "1"
+
+rusqlite = { version = "0.38", features = ["bundled-sqlcipher-vendored-openssl"] }
+rpassword = "7"
+argon2 = "0.5"
+rand = "0.8"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,17 @@
+[package]
+name = "spike-tor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+arti-client.workspace = true
+tor-hsservice.workspace = true
+tor-rtcompat.workspace = true
+tor-cell.workspace = true
+safelog.workspace = true

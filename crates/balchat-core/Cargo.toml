@@ -1,0 +1,31 @@
+[package]
+name = "balchat-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+hex = "0.4"
+
+openmls.workspace = true
+openmls_traits.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_basic_credential.workspace = true
+
+arti-client.workspace = true
+tor-hsservice.workspace = true
+tor-rtcompat.workspace = true
+tor-cell.workspace = true
+safelog.workspace = true
+
+balchat-storage.workspace = true
+balchat-relay-proto.workspace = true
+rand = "0.8"

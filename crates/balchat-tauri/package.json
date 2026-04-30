@@ -1,0 +1,10 @@
+{
+  "name": "balchat-tauri-root",
+  "version": "0.0.1",
+  "private": true,
+  "comment": "Forwarder. Tauri ejecuta beforeBuildCommand desde el dir del crate (desktop) o desde ui/ (android). En ambos casos `npm run build` resuelve al script local apropiado: aquí forward a ui/, en ui/ corre vite build directo.",
+  "scripts": {
+    "build": "npm --prefix ui run build",
+    "dev": "npm --prefix ui run dev"
+  }
+}

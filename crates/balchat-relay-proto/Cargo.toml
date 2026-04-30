@@ -1,0 +1,12 @@
+[package]
+name = "balchat-relay-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
