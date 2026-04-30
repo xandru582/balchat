@@ -518,6 +518,112 @@ mod tests {
         Ok(())
     }
 
+    /// Fase 5b: cuando A invita a Carol al grupo donde Bob ya está, A envía el
+    /// Commit a Bob por relay (Bob offline). Cuando Bob hace poll, debe poder
+    /// procesar ese blob como `InboundBlob::Commit`, mergear el StagedCommit, y
+    /// quedar en el mismo epoch que A — para que mensajes posteriores del grupo
+    /// (encriptados al nuevo árbol de miembros) le descifren.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_via_blob_advances_member_epoch() -> Result<()> {
+        use crate::identity;
+        use openmls::prelude::tls_codec::Serialize as _;
+        use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+        use openmls_traits::OpenMlsProvider as _;
+
+        let alice = Identity::new("alice")?;
+        let bob = Identity::new("bob")?;
+        let carol = Identity::new("carol")?;
+
+        // 1) Alice crea un grupo y agrega a Bob (vía Welcome offline).
+        let bob_kp_bytes = bob
+            .fresh_key_package()?
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize bob KP: {e:?}"))?;
+        let bob_kp = KeyPackageIn::tls_deserialize_exact_bytes(&bob_kp_bytes)
+            .map_err(|e| anyhow!("deserialize bob KP: {e:?}"))?
+            .validate(alice.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| anyhow!("validate bob KP: {e:?}"))?;
+        let mut alice_group = identity::create_group(&alice)?;
+        let alice_group_id = alice_group.group_id().as_slice().to_vec();
+        let (_commit_b, welcome_b, _info_b) = alice_group
+            .add_members(&alice.provider, &alice.signer, &[bob_kp])
+            .map_err(|e| anyhow!("add_members bob: {e:?}"))?;
+        alice_group
+            .merge_pending_commit(&alice.provider)
+            .map_err(|e| anyhow!("merge bob: {e:?}"))?;
+        let welcome_b_bytes = welcome_b
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize welcome bob: {e:?}"))?;
+        let bob_joined_gid = identity::process_welcome_blob(&bob, &welcome_b_bytes)?;
+        assert_eq!(bob_joined_gid, alice_group_id);
+        assert_eq!(alice_group.epoch().as_u64(), 1);
+
+        // 2) Alice invita a Carol mientras Bob está offline. Esto produce un
+        //    Commit que NO viaja en ningún Conversation activo — Alice lo serializa
+        //    y lo deja en el queue del relay de Bob.
+        let carol_kp_bytes = carol
+            .fresh_key_package()?
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize carol KP: {e:?}"))?;
+        let carol_kp = KeyPackageIn::tls_deserialize_exact_bytes(&carol_kp_bytes)
+            .map_err(|e| anyhow!("deserialize carol KP: {e:?}"))?
+            .validate(alice.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| anyhow!("validate carol KP: {e:?}"))?;
+        let (commit_c, welcome_c, _info_c) = alice_group
+            .add_members(&alice.provider, &alice.signer, &[carol_kp])
+            .map_err(|e| anyhow!("add_members carol: {e:?}"))?;
+        alice_group
+            .merge_pending_commit(&alice.provider)
+            .map_err(|e| anyhow!("merge carol: {e:?}"))?;
+        let commit_c_bytes = commit_c
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize commit: {e:?}"))?;
+        let _welcome_c_bytes = welcome_c
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize welcome carol: {e:?}"))?;
+        assert_eq!(alice_group.epoch().as_u64(), 2);
+
+        // 3) Bob recibe el Commit como blob (relay). El helper unificado debe:
+        //    a) detectar que NO es Welcome (es un Commit dentro de PrivateMessage),
+        //    b) cargar su MlsGroup, process_message → StagedCommit,
+        //    c) merge_staged_commit → epoch ahora 2,
+        //    d) reportar `InboundBlob::Commit { epoch: 2 }`.
+        let processed = process_inbound_blob(&bob, &commit_c_bytes)?;
+        match processed {
+            InboundBlob::Commit { group_id, epoch } => {
+                assert_eq!(group_id, alice_group_id, "group_id no coincide");
+                assert_eq!(epoch, 2, "epoch debe avanzar a 2 tras Commit");
+            }
+            other => panic!("esperaba InboundBlob::Commit, llegó {other:?}"),
+        }
+
+        // 4) Sanity check: ahora Alice manda un Application message; Bob (epoch=2)
+        //    debe poder descifrarlo. Si Bob hubiera quedado en epoch=1, fallaría.
+        let payload = AppPayload::Text("post-commit ping".into());
+        let mut payload_bytes = Vec::with_capacity(64);
+        ciborium::ser::into_writer(&payload, &mut payload_bytes)?;
+        let app_out = alice_group
+            .create_message(&alice.provider, &alice.signer, &payload_bytes)
+            .map_err(|e| anyhow!("create_message post-commit: {e:?}"))?;
+        let app_blob = app_out
+            .tls_serialize_detached()
+            .map_err(|e| anyhow!("serialize app: {e:?}"))?;
+        let processed = process_inbound_blob(&bob, &app_blob)?;
+        match processed {
+            InboundBlob::App {
+                payload: AppPayload::Text(t),
+                group_id,
+            } => {
+                assert_eq!(t, "post-commit ping");
+                assert_eq!(group_id, alice_group_id);
+            }
+            other => panic!("esperaba InboundBlob::App(Text), llegó {other:?}"),
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_payload_roundtrip() -> Result<()> {
         let alice = Identity::new("alice")?;
@@ -621,6 +727,79 @@ pub struct NoResume;
 impl ResumeResolver for NoResume {
     fn group_id_for(&self, _peer_onion: &str) -> Option<Vec<u8>> {
         None
+    }
+}
+
+/// Resultado de procesar un blob MLS recibido desde el wire (relay o conexión
+/// directa one-shot, sin un `Conversation` activo). Unifica los tres casos
+/// posibles: Welcome (joineamos un grupo nuevo), Application (mensaje de chat),
+/// Commit (alguien invitó a otro miembro y nosotros tenemos que avanzar epoch).
+#[derive(Debug)]
+pub enum InboundBlob {
+    /// Llegó un `MlsMessage::Welcome`: ya joineamos el grupo. El caller suele
+    /// querer registrarlo en su vault local.
+    Welcome { group_id: Vec<u8> },
+    /// Application message descifrado.
+    App {
+        payload: AppPayload,
+        group_id: Vec<u8>,
+    },
+    /// `StagedCommitMessage` aplicado: epoch del grupo avanzó. Pasa cuando otro
+    /// miembro invitó/expulsó a alguien y nos disemina el Commit. El blob ya
+    /// se mergeó en el `MlsGroup` persistido — el caller solo tiene que
+    /// `identity::save` y opcionalmente actualizar membresía si la lleva aparte.
+    Commit { group_id: Vec<u8>, epoch: u64 },
+}
+
+/// Procesa un blob MLS recibido del wire (típicamente vía `RelayClient::get`)
+/// sin requerir un `Conversation` activo. Detecta automáticamente si es Welcome,
+/// Application message o Commit, aplica los efectos sobre el `MlsGroup` (joinear /
+/// descifrar / mergear) y devuelve el outcome.
+///
+/// Para Welcome y Commit el state MLS queda mutado en el storage del provider —
+/// llamar `identity::save(vault, identity)` después para persistirlo en el vault
+/// SQLCipher.
+pub fn process_inbound_blob(identity: &Identity, blob: &[u8]) -> Result<InboundBlob> {
+    if crate::identity::blob_is_welcome(blob) {
+        let group_id = crate::identity::process_welcome_blob(identity, blob)?;
+        return Ok(InboundBlob::Welcome { group_id });
+    }
+
+    let in_msg = MlsMessageIn::tls_deserialize_exact_bytes(blob)
+        .context("deserializar MlsMessageIn")?;
+    let proto: ProtocolMessage = in_msg
+        .try_into_protocol_message()
+        .map_err(|_| anyhow!("frame MLS no es ProtocolMessage"))?;
+    let group_id = proto.group_id().as_slice().to_vec();
+    let mut group = MlsGroup::load(
+        identity.provider.storage(),
+        &GroupId::from_slice(&group_id),
+    )
+    .map_err(|e| anyhow!("MlsGroup::load: {e:?}"))?
+    .ok_or_else(|| anyhow!("group_id del blob no en mi storage MLS"))?;
+    let processed = group
+        .process_message(&identity.provider, proto)
+        .context("process_message")?;
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app) => {
+            let bytes = app.into_bytes();
+            // Compat con texto plano legacy (pre-CBOR): si CBOR falla, tratamos como UTF-8.
+            let payload = match ciborium::de::from_reader::<AppPayload, _>(&bytes[..]) {
+                Ok(p) => p,
+                Err(_) => AppPayload::Text(String::from_utf8_lossy(&bytes).into_owned()),
+            };
+            Ok(InboundBlob::App { payload, group_id })
+        }
+        ProcessedMessageContent::StagedCommitMessage(staged) => {
+            group
+                .merge_staged_commit(&identity.provider, *staged)
+                .context("merge_staged_commit")?;
+            let epoch = group.epoch().as_u64();
+            Ok(InboundBlob::Commit { group_id, epoch })
+        }
+        other => Err(anyhow!(
+            "contenido MLS inesperado en blob (no App ni Commit ni Welcome): {other:?}"
+        )),
     }
 }
 

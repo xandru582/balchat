@@ -9,7 +9,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use balchat_core::conversation::{
-    AppPayload, Conversation, HandshakeOutcome, ResumeResolver, Role,
+    process_inbound_blob, AppPayload, Conversation, HandshakeOutcome, InboundBlob, ResumeResolver,
+    Role,
 };
 use balchat_core::relay_client::RelayClient;
 use balchat_core::{identity, DataStream, Endpoint, HostHandle, Identity};
@@ -672,60 +673,51 @@ async fn poll_and_emit(
 
     let mut new_last = last_seq;
     for msg in &messages {
-        // Detectar Welcomes que llegan vía relay (peer offline nos invitó a un
-        // grupo). Si el blob es un Welcome, joineamos el grupo, lo registramos
-        // en el vault con un label sintético para que aparezca en la lista de
-        // contactos/grupos, y emitimos un Info al frontend. Después seguimos al
-        // siguiente blob (no llamamos a decrypt_blob porque no es App message).
-        if identity::blob_is_welcome(&msg.blob) {
-            match identity::process_welcome_blob(identity, &msg.blob) {
-                Ok(group_id) => {
-                    if let Err(e) = identity::save(vault, identity) {
-                        tracing::warn!("identity::save tras Welcome falló: {e:#}");
-                    }
-                    if vault
-                        .get_group_by_mls_id(&group_id)
-                        .ok()
-                        .flatten()
-                        .is_none()
-                    {
-                        let label = format!("inbox-{}", &hex_encode(&group_id)[..8]);
-                        if let Err(e) = vault.create_group(&label, &group_id) {
-                            tracing::warn!("registrar grupo offline en vault falló: {e:#}");
-                        }
-                    }
-                    let _ = app.emit(
-                        "balchat://message",
-                        LogEntry::Info {
-                            text: format!(
-                                "joineado grupo MLS via Welcome offline (group_id={})",
-                                &hex_encode(&group_id)[..16]
-                            ),
-                        },
-                    );
-                    send_system_notification(
-                        app,
-                        "balchat",
-                        "te han invitado a un grupo nuevo",
-                    );
+        match process_inbound_blob(identity, &msg.blob) {
+            Ok(InboundBlob::Welcome { group_id }) => {
+                if let Err(e) = identity::save(vault, identity) {
+                    tracing::warn!("identity::save tras Welcome falló: {e:#}");
                 }
-                Err(e) => {
-                    let _ = app.emit(
-                        "balchat://message",
-                        LogEntry::Error {
-                            text: format!("procesar Welcome falló (seq={}): {e:#}", msg.seq),
-                        },
-                    );
+                if vault
+                    .get_group_by_mls_id(&group_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let label = format!("inbox-{}", &hex_encode(&group_id)[..8]);
+                    if let Err(e) = vault.create_group(&label, &group_id) {
+                        tracing::warn!("registrar grupo offline en vault falló: {e:#}");
+                    }
                 }
+                let _ = app.emit(
+                    "balchat://message",
+                    LogEntry::Info {
+                        text: format!(
+                            "joineado grupo MLS via Welcome offline (group_id={})",
+                            &hex_encode(&group_id)[..16]
+                        ),
+                    },
+                );
+                send_system_notification(app, "balchat", "te han invitado a un grupo nuevo");
             }
-            if msg.seq > new_last {
-                new_last = msg.seq;
+            Ok(InboundBlob::Commit { group_id, epoch }) => {
+                // Otro miembro del grupo invitó/expulsó a alguien y nos
+                // diseminó el Commit por relay. El merge ya pasó dentro del
+                // helper; persistimos y notificamos suavemente al frontend.
+                if let Err(e) = identity::save(vault, identity) {
+                    tracing::warn!("identity::save tras Commit falló: {e:#}");
+                }
+                let _ = app.emit(
+                    "balchat://message",
+                    LogEntry::Info {
+                        text: format!(
+                            "grupo {} actualizado (epoch={epoch})",
+                            &hex_encode(&group_id)[..16]
+                        ),
+                    },
+                );
             }
-            continue;
-        }
-
-        match decrypt_blob(identity, &msg.blob) {
-            Ok((payload, group_id)) => {
+            Ok(InboundBlob::App { payload, group_id }) => {
                 // Resolvemos al contacto vía group_id; si no lo encontramos,
                 // marcamos con un pseudo-id basado en el queue. La persistencia
                 // usa el onion real cuando está disponible para que el histórico
@@ -774,17 +766,17 @@ async fn poll_and_emit(
                         );
                     }
                 }
+                identity::save(vault, identity)?;
             }
             Err(e) => {
                 let _ = app.emit(
                     "balchat://message",
                     LogEntry::Error {
-                        text: format!("descifrado falló (seq={}): {e:#}", msg.seq),
+                        text: format!("proceso falló (seq={}): {e:#}", msg.seq),
                     },
                 );
             }
         }
-        identity::save(vault, identity)?;
         if msg.seq > new_last {
             new_last = msg.seq;
         }
@@ -881,35 +873,6 @@ fn send_system_notification(app: &AppHandle, title: &str, body: &str) {
         .show();
     if let Err(e) = res {
         tracing::warn!("notification.show falló: {e:#}");
-    }
-}
-
-/// Descifra un blob MLS y devuelve además el `group_id` del MLS group, para que
-/// el caller pueda resolverlo a un contacto (relevante en mensajes via relay,
-/// donde el blob no lleva el onion del sender).
-fn decrypt_blob(identity: &Identity, blob: &[u8]) -> Result<(AppPayload, Vec<u8>)> {
-    let in_msg = MlsMessageIn::tls_deserialize_exact_bytes(blob).context("deserializar MLS")?;
-    let proto: ProtocolMessage = in_msg
-        .try_into_protocol_message()
-        .map_err(|_| anyhow!("frame no es ProtocolMessage"))?;
-    let group_id = proto.group_id().clone();
-    let group_id_bytes = group_id.as_slice().to_vec();
-    let mut group = MlsGroup::load(identity.provider.storage(), &group_id)
-        .map_err(|e| anyhow!("MlsGroup::load: {e:?}"))?
-        .ok_or_else(|| anyhow!("group_id no en mi storage"))?;
-    let processed = group
-        .process_message(&identity.provider, proto)
-        .context("process_message")?;
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app) => {
-            let bytes = app.into_bytes();
-            let payload = match ciborium::de::from_reader::<AppPayload, _>(&bytes[..]) {
-                Ok(p) => p,
-                Err(_) => AppPayload::Text(String::from_utf8_lossy(&bytes).into_owned()),
-            };
-            Ok((payload, group_id_bytes))
-        }
-        other => Err(anyhow!("contenido inesperado: {other:?}")),
     }
 }
 

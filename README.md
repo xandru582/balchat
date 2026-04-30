@@ -393,9 +393,10 @@ y publicarlo via Play Store o como FDroid build.**
 | 4b | UI: histórico persistido + timestamps + auto-scroll | ✓ |
 | 4c | UI: notificaciones + file transfer + copiar onion | ✓ |
 | 5a | Welcome offline vía relay (grupos con miembros offline) | ✓ |
-| 5b | Multi-ABI APK (armv7 + x86_64 + x86) | pendiente — hoy sólo arm64 |
-| 5c | iOS | pendiente |
-| 5d | Auditoría de protocolo + KAT formales | pendiente |
+| 5b | Commit dissemination offline (existing members reciben Add Commit por relay) | ✓ |
+| 5c | Multi-ABI APK (armv7 + x86_64 + x86) | pendiente — hoy sólo arm64 |
+| 5d | iOS | pendiente |
+| 5e | Auditoría de protocolo + KAT formales | pendiente |
 
 ---
 
@@ -404,11 +405,6 @@ y publicarlo via Play Store o como FDroid build.**
 - **Send-file vía relay limitado a ~14 MiB** (cabe en un solo MLS Application
   message). Files más grandes requieren chunking + reassembly que no está
   implementado.
-- **Grupos n-way: dissemination del Commit a miembros offline.** El comando
-  `invite` ahora cae al relay si el peer nuevo no está online (Welcome offline
-  funciona, fase 5a). Pero el `Commit` que se disemina a los **otros** miembros
-  ya existentes solo intenta directo + relay vía `deliver_to_member`; si alguno
-  está offline y sin relay, queda con epoch viejo hasta el próximo handshake live.
 - **Relay no autentica:** queue_id es la credencial. Conocerlo permite leer/borrar
   blobs (no descifrarlos). Los queue_ids se distribuyen out-of-band entre peers
   que ya se confían.
@@ -442,23 +438,25 @@ y publicarlo via Play Store o como FDroid build.**
 cargo test --workspace                  # storage + core (sin Tor; usan DuplexStream)
 ```
 
-Cobertura actual (12/12 passing):
+Cobertura actual (13/13 passing):
 - `balchat-storage` — 6 tests: vault create/open, KV roundtrip, contacts upsert,
   passphrases con caracteres raros, vaults legacy sin salt, messages
   insert/list/limit, delete cascade.
-- `balchat-core` — 6 tests: identity roundtrip, KeyPackage tras restore,
+- `balchat-core` — 7 tests: identity roundtrip, KeyPackage tras restore,
   fresh handshake con texto y archivos, cross-sign mismatch aborta handshake,
-  **Welcome offline vía KeyPackage pool** (fase 5a — Alice add_members → Welcome
-  bytes → Bob process_welcome_blob → app message roundtrip).
+  **Welcome offline vía KeyPackage pool** (fase 5a), **Commit aplicado vía blob
+  avanza el epoch del miembro existente** (fase 5b — Alice add_members(Carol),
+  Bob procesa el Commit por relay → epoch=2, descifra mensajes posteriores).
 
 ---
 
 ## Roadmap
 
 - [x] Welcome offline vía relay (5a)
-- [ ] Multi-ABI APK (5b)
-- [ ] iOS (5c)
-- [ ] Auditoría de protocolo + tests KAT (5d)
+- [x] Commit dissemination offline (5b)
+- [ ] Multi-ABI APK (5c)
+- [ ] iOS (5d)
+- [ ] Auditoría de protocolo + tests KAT (5e)
 - [ ] Preview del último mensaje + badge "no leído" en la lista de contactos
 - [ ] Setear relay desde la UI (hoy `set-my-relay` solo CLI)
 - [ ] Publicar KeyPackage desde la UI (hoy `publish-kp` solo CLI)

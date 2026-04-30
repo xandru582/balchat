@@ -13,8 +13,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use balchat_core::conversation::{
-    invite_peer_to_existing_group, push_message_to_group_member, AppPayload, Conversation,
-    HandshakeOutcome, ResumeResolver, Role,
+    invite_peer_to_existing_group, process_inbound_blob, push_message_to_group_member, AppPayload,
+    Conversation, HandshakeOutcome, InboundBlob, ResumeResolver, Role,
 };
 use balchat_core::relay_client::RelayClient;
 use balchat_core::{identity, DataStream, Endpoint, Identity};
@@ -705,46 +705,52 @@ async fn poll_once(
 
     let mut new_last = last_seq;
     for msg in &messages {
-        // Detectar Welcomes (handshake offline iniciado por un peer): si el blob
-        // es un Welcome, joinear el grupo y emitir info; si no, descifrar como hoy.
-        if identity::blob_is_welcome(&msg.blob) {
-            match identity::process_welcome_blob(identity, &msg.blob) {
-                Ok(group_id) => {
-                    identity::save(vault, identity).ok();
-                    // Persistir el grupo con un label sintético si todavía no existe
-                    // (para que aparezca en `balchat groups` y se pueda enviar a él).
-                    if vault
-                        .get_group_by_mls_id(&group_id)
-                        .ok()
-                        .flatten()
-                        .is_none()
-                    {
-                        let label = format!("inbox-{}", hex_short_owned(&group_id).trim_end_matches('…'));
-                        if let Err(e) = vault.create_group(&label, &group_id) {
-                            tracing::warn!("registrar grupo offline en vault falló: {e:#}");
-                        }
-                    }
-                    tracing::info!(
-                        seq = msg.seq,
-                        "[seq={}] joineado grupo MLS via Welcome offline (group_id={})",
-                        msg.seq,
-                        hex_short_owned(&group_id),
+        match process_inbound_blob(identity, &msg.blob) {
+            Ok(InboundBlob::Welcome { group_id }) => {
+                identity::save(vault, identity).ok();
+                // Registrar el grupo con un label sintético si todavía no existe
+                // (para que aparezca en `balchat groups` y se pueda enviar a él).
+                if vault
+                    .get_group_by_mls_id(&group_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let label = format!(
+                        "inbox-{}",
+                        hex_short_owned(&group_id).trim_end_matches('…')
                     );
+                    if let Err(e) = vault.create_group(&label, &group_id) {
+                        tracing::warn!("registrar grupo offline en vault falló: {e:#}");
+                    }
                 }
-                Err(e) => tracing::warn!(
+                tracing::info!(
                     seq = msg.seq,
-                    "[seq={}] procesar Welcome falló: {e:#}",
-                    msg.seq
-                ),
+                    "[seq={}] joineado grupo MLS via Welcome offline (group_id={})",
+                    msg.seq,
+                    hex_short_owned(&group_id),
+                );
             }
-            if msg.seq > new_last {
-                new_last = msg.seq;
+            Ok(InboundBlob::Commit { group_id, epoch }) => {
+                // Otro miembro invitó/expulsó a alguien y nos reenvió el Commit
+                // mientras estábamos offline. El merge ya pasó dentro del helper;
+                // solo persistimos el state actualizado.
+                identity::save(vault, identity).ok();
+                tracing::info!(
+                    seq = msg.seq,
+                    "[seq={}] commit MLS aplicado: group={}, epoch={epoch}",
+                    msg.seq,
+                    hex_short_owned(&group_id),
+                );
             }
-            continue;
-        }
-        match decrypt_blob(identity, &msg.blob) {
-            Ok(AppPayload::Text(t)) => tracing::info!(seq = msg.seq, "[seq={}] {t}", msg.seq),
-            Ok(AppPayload::File { filename, data }) => {
+            Ok(InboundBlob::App {
+                payload: AppPayload::Text(t),
+                ..
+            }) => tracing::info!(seq = msg.seq, "[seq={}] {t}", msg.seq),
+            Ok(InboundBlob::App {
+                payload: AppPayload::File { filename, data },
+                ..
+            }) => {
                 let inbox_dir = inbox_for(vault, "from-relay");
                 match save_to_inbox(&inbox_dir, &filename, &data) {
                     Ok(path) => tracing::info!(
@@ -762,7 +768,7 @@ async fn poll_once(
                     ),
                 }
             }
-            Err(e) => tracing::warn!(seq = msg.seq, "[seq={}] descifrado falló: {e:#}", msg.seq),
+            Err(e) => tracing::warn!(seq = msg.seq, "[seq={}] proceso falló: {e:#}", msg.seq),
         }
         if msg.seq > new_last {
             new_last = msg.seq;
@@ -780,31 +786,6 @@ fn my_relay_and_queue(vault: &Vault) -> Result<(String, Vec<u8>)> {
     Ok((relay, queue))
 }
 
-
-fn decrypt_blob(identity: &Identity, blob: &[u8]) -> Result<AppPayload> {
-    let in_msg = MlsMessageIn::tls_deserialize_exact_bytes(blob).context("deserializar MLS")?;
-    let proto: ProtocolMessage = in_msg
-        .try_into_protocol_message()
-        .map_err(|_| anyhow!("frame no es ProtocolMessage"))?;
-    let group_id = proto.group_id().clone();
-    let mut group = MlsGroup::load(identity.provider.storage(), &group_id)
-        .map_err(|e| anyhow!("MlsGroup::load: {e:?}"))?
-        .ok_or_else(|| anyhow!("group_id del mensaje no está en mi storage"))?;
-    let processed = group
-        .process_message(&identity.provider, proto)
-        .context("process_message")?;
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app) => {
-            let bytes = app.into_bytes();
-            // Compat: bytes son CBOR de AppPayload, o (legacy) UTF-8 plano.
-            match ciborium::de::from_reader::<AppPayload, _>(&bytes[..]) {
-                Ok(p) => Ok(p),
-                Err(_) => Ok(AppPayload::Text(String::from_utf8_lossy(&bytes).into_owned())),
-            }
-        }
-        other => Err(anyhow!("contenido inesperado: {other:?}")),
-    }
-}
 
 // ---------- Grupos n-way ----------
 
