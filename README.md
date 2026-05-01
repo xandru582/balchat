@@ -4,10 +4,21 @@
 > con **mensajería offline** vía un relay no-confiable. Sin servidores centrales obligatorios,
 > sin números de teléfono, sin email. **Todo en Rust** + UI Tauri 2 (desktop + Android).
 
-> ⚠️ **Estado: prototipo / spike funcional.** El protocolo está implementado, los binarios
-> compilan en macOS/Linux/Android y el flujo end-to-end funciona, pero **no hay auditoría
-> externa de seguridad**, e iOS y multi-ABI Android están **scaffolded pero no verificados
-> en hardware** (ver [docs/](docs/)). No usar en escenarios reales hasta entonces.
+> ⚠️ **Estado: prototipo / spike funcional.** Los cuatro binarios principales
+> (CLI + relay + desktop + APK) compilan release y arrancan en
+> **macOS / Android / Linux / Windows**. Falta auditoría externa de seguridad,
+> y **iOS** queda scaffolded pero sin verificar en device (ver
+> [docs/ios-build.md](docs/ios-build.md)). No usar en escenarios reales hasta
+> que haya audit.
+
+| Target | Verificado en esta máquina | Cómo |
+|---|---|---|
+| macOS aarch64 (Apple Silicon) | ✅ `.app` 35 MB · `.dmg` 62 MB | `cargo tauri build` nativo |
+| Android aarch64 (arm64-v8a) | ✅ APK 43 MB firmado (debug.keystore) | `cargo tauri android build --target aarch64 --apk` con NDK 30 |
+| Linux x86_64 (`*-unknown-linux-gnu`) | ✅ ELF 26 MB / 21 MB stripped | `cargo zigbuild --target x86_64-unknown-linux-gnu` |
+| Windows x86_64 (`*-pc-windows-gnu`) | ✅ PE32+ 32 MB / 30 MB | `cargo zigbuild --target x86_64-pc-windows-gnu` |
+| iOS (aarch64-apple-ios) | ⚠️ scaffolded | requiere Xcode.app + device, ver [docs/ios-build.md](docs/ios-build.md) |
+| Android multi-ABI (armv7/x86_64/i686) | ⚠️ scaffolded | requiere ajustes de cross-compile OpenSSL, ver [docs/android-multi-abi.md](docs/android-multi-abi.md) |
 
 ---
 
@@ -233,20 +244,61 @@ cd crates/balchat-tauri && cargo tauri build
 
 ```bash
 export ANDROID_HOME=~/Library/Android/sdk
-export NDK_HOME=$ANDROID_HOME/ndk/30.0.13846066
+export NDK_HOME=$ANDROID_HOME/ndk/30.0.14904198      # ajustar a la versión instalada
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 export PATH=$PATH:$ANDROID_HOME/platform-tools
+
+# Symlinks para que el OpenSSL vendored encuentre el toolchain del NDK:
+NDK_BIN=$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin
+for arch in aarch64-linux-android armv7a-linux-androideabi i686-linux-android x86_64-linux-android; do
+  for tool in ar ranlib nm strip; do
+    ln -sf "$NDK_BIN/llvm-$tool" "$HOME/.cargo/bin/$arch-$tool"
+  done
+done
 
 cd crates/balchat-tauri
 cargo tauri android build --target aarch64 --apk
 
 # APK queda en gen/android/app/build/outputs/apk/universal/release/
 # Hay que zipalign + apksigner antes de instalar:
-
-zipalign -p 4 app-universal-release-unsigned.apk balchat-signed.apk
-apksigner sign --ks ~/.balchat/release.keystore --ks-pass pass:... balchat-signed.apk
-adb install -r balchat-signed.apk
+APK=gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+$ANDROID_HOME/build-tools/37.0.0/zipalign -p -f 4 "$APK" /tmp/balchat-aligned.apk
+$ANDROID_HOME/build-tools/37.0.0/apksigner sign \
+    --ks ~/.android/debug.keystore --ks-pass pass:android \
+    --key-pass pass:android --ks-key-alias androiddebugkey \
+    --out /tmp/balchat-signed.apk /tmp/balchat-aligned.apk
+adb install -r /tmp/balchat-signed.apk
 ```
+
+**Verificado en hardware:** APK release aarch64 firmado, 43 MB
+(`lib/arm64-v8a/libbalchat_mobile.so` 40 MB stripped).
+
+### Cross-compile a Linux y Windows (desde macOS)
+
+Usamos [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) que
+delega a `zig cc` como cross-linker; resuelve el OpenSSL vendored sin instalar
+GCC cross-toolchains separados.
+
+```bash
+brew install zig                                 # ~120 MB
+cargo install cargo-zigbuild                     # ~30 s
+rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+
+# Linux x86_64 (CLI + relay):
+cargo zigbuild --release --target x86_64-unknown-linux-gnu \
+    -p balchat-cli -p balchat-relay
+# → target/x86_64-unknown-linux-gnu/release/balchat (~26 MB ELF stripped)
+
+# Windows x86_64 (CLI + relay):
+cargo zigbuild --release --target x86_64-pc-windows-gnu \
+    -p balchat-cli -p balchat-relay
+# → target/x86_64-pc-windows-gnu/release/balchat.exe
+```
+
+> El bundle Tauri desktop (.deb / .AppImage / .msi) requiere correr el build
+> en su SO nativo — webview2 y los plugins de Tauri no cross-compilan. La
+> recomendación es CI con runners Linux/Windows, o construir manualmente
+> en cada SO. El binario CLI sí cross-compila desde macOS sin problema.
 
 ---
 
