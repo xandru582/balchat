@@ -1,0 +1,188 @@
+/* balchat — design tokens + base reset.
+   Auto light/dark via prefers-color-scheme. macOS-first palette inspired by
+   Messages.app: Apple Blue accents, neutral grays, SF system font. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Typography stack — SF on Apple platforms, fallbacks elsewhere. */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+               "Helvetica Neue", "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Menlo", "JetBrains Mono", monospace;
+
+  /* Layout primitives. */
+  --sidebar-w: 280px;
+  --titlebar-h: 38px;            /* macOS overlay traffic-light area */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-bubble: 18px;
+
+  /* Daemon status. */
+  --status-idle: #8e8e93;
+  --status-starting: #ffb340;
+  --status-running: #34c759;
+  --status-error: #ff453a;
+}
+
+/* ---- Light ---- */
+:root {
+  --bg: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-sidebar: rgba(246, 246, 247, 0.78);
+  --bg-sidebar-solid: #f6f6f7;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.04);
+  --bg-selected: rgba(0, 122, 255, 0.10);
+  --bg-selected-strong: #007aff;
+  --bg-bubble-recv: #e9e9eb;
+  --bg-bubble-sent: #007aff;
+  --bg-modal-backdrop: rgba(0, 0, 0, 0.32);
+  --bg-modal: #ffffff;
+  --bg-pill: rgba(120, 120, 128, 0.16);
+
+  --fg: #000000;
+  --fg-secondary: rgba(60, 60, 67, 0.72);
+  --fg-tertiary: rgba(60, 60, 67, 0.45);
+  --fg-bubble-recv: #000000;
+  --fg-bubble-sent: #ffffff;
+  --fg-on-selected: #ffffff;
+
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --separator: rgba(0, 0, 0, 0.06);
+
+  --accent: #007aff;
+  --accent-hover: #0062cc;
+  --danger: #ff3b30;
+  --warning: #ff9500;
+  --success: #34c759;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.10);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.22);
+}
+
+/* ---- Dark ---- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --bg-elevated: #2c2c2e;
+    --bg-sidebar: rgba(28, 28, 30, 0.72);
+    --bg-sidebar-solid: #1c1c1e;
+    --bg-input: #2c2c2e;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-selected: rgba(10, 132, 255, 0.20);
+    --bg-selected-strong: #0a84ff;
+    --bg-bubble-recv: #3a3a3c;
+    --bg-bubble-sent: #0a84ff;
+    --bg-modal-backdrop: rgba(0, 0, 0, 0.55);
+    --bg-modal: #2c2c2e;
+    --bg-pill: rgba(120, 120, 128, 0.32);
+
+    --fg: #ffffff;
+    --fg-secondary: rgba(235, 235, 245, 0.66);
+    --fg-tertiary: rgba(235, 235, 245, 0.40);
+    --fg-bubble-recv: #ffffff;
+    --fg-bubble-sent: #ffffff;
+    --fg-on-selected: #ffffff;
+
+    --border: rgba(255, 255, 255, 0.10);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --separator: rgba(255, 255, 255, 0.07);
+
+    --accent: #0a84ff;
+    --accent-hover: #409cff;
+    --danger: #ff453a;
+    --warning: #ff9f0a;
+    --success: #30d158;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.6);
+  }
+}
+
+/* ---- Reset & base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.4;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+input, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+  user-select: text;
+}
+input:focus, textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+input::placeholder, textarea::placeholder { color: var(--fg-tertiary); }
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--bg-pill);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+a { color: var(--accent); text-decoration: none; cursor: pointer; }
+a:hover { text-decoration: underline; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 18%, transparent);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg) 32%, transparent);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Drag region — apply to header strips so users can move the window. */
+[data-tauri-drag-region] { -webkit-app-region: drag; app-region: drag; }
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] a,
+[data-tauri-drag-region] .no-drag { -webkit-app-region: no-drag; app-region: no-drag; }

@@ -32,6 +32,16 @@ const NICKNAME: &str = "balchat";
 const VAULT_KEY_MY_ONION: &str = "my_onion.v1";
 const VAULT_KEY_AUTO_LOCK_MINUTES: &str = "auto_lock_minutes.v1";
 
+/// Default public relay shipped with the app. Used when the user hasn't picked
+/// one explicitly — first-run experience for non-technical users. Operator only
+/// sees opaque ciphertext blobs (MLS), never message content.
+const DEFAULT_RELAY_ONION: &str =
+    "dun4powrdfdaw3rtltyqhihxvefvkquoczqy4bqvtityu5sbdpq4ofid.onion";
+
+/// Initial KeyPackage pool size auto-published once per session. Lets offline
+/// peers invite us via Welcome without us having to be online.
+const DEFAULT_KP_POOL_SIZE: u32 = 10;
+
 // -------- AppState compartido --------
 
 struct AppState {
@@ -117,6 +127,13 @@ struct StatusUpdate {
     status: &'static str,
 }
 
+/// Notifica al frontend que un contacto cambió de estado y conviene refrescar
+/// la lista (típicamente: handshake recién completado → `has_group` pasó a true).
+#[derive(Serialize, Clone)]
+struct ContactUpdated {
+    peer: String,
+}
+
 /// Una entrada del histórico (proyección sobre `StoredMessage` para serializar
 /// al frontend). El campo `created_at` es Unix timestamp en segundos.
 #[derive(Serialize, Clone)]
@@ -165,7 +182,7 @@ async fn create_vault(
     };
     let id = identity::load_or_create(&vault, &label).map_err(stringify)?;
     let queue = identity::load_or_create_queue_id(&vault).map_err(stringify)?;
-    let relay = identity::get_my_relay(&vault).map_err(stringify)?.unwrap_or_default();
+    let relay = ensure_default_relay(&vault).map_err(stringify)?;
     let onion = vault
         .kv_get(VAULT_KEY_MY_ONION)
         .map_err(stringify)?
@@ -202,7 +219,7 @@ async fn unlock_vault(
     let vault = Vault::open(&inner.vault_path, &passphrase).map_err(stringify)?;
     let id = identity::load_or_create(&vault, "me").map_err(stringify)?;
     let queue = identity::load_or_create_queue_id(&vault).map_err(stringify)?;
-    let relay = identity::get_my_relay(&vault).map_err(stringify)?.unwrap_or_default();
+    let relay = ensure_default_relay(&vault).map_err(stringify)?;
     let onion = vault
         .kv_get(VAULT_KEY_MY_ONION)
         .map_err(stringify)?
@@ -307,6 +324,37 @@ async fn set_my_relay_cmd(
         queue: hex_encode(&queue),
         relay: trimmed.to_string(),
     })
+}
+
+/// Lee la identidad propia del vault en cualquier momento. Útil para que la UI
+/// refresque el onion address después de que el daemon termine de provisionar
+/// el hidden service (la respuesta de `unlock_vault` puede llegar antes de que
+/// el onion exista).
+#[tauri::command]
+async fn get_my_id(state: State<'_, AppState>) -> Result<MyId, String> {
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let queue = identity::load_or_create_queue_id(vault).map_err(stringify)?;
+    let relay = ensure_default_relay(vault).map_err(stringify)?;
+    let onion = vault
+        .kv_get(VAULT_KEY_MY_ONION)
+        .map_err(stringify)?
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    Ok(MyId { onion, queue: hex_encode(&queue), relay })
+}
+
+/// Returns the configured relay onion, falling back to (and persisting) the
+/// shipped public default the first time. Lets non-technical users skip the
+/// "configure your mailbox" step entirely.
+fn ensure_default_relay(vault: &Vault) -> anyhow::Result<String> {
+    if let Some(r) = identity::get_my_relay(vault)? {
+        if !r.trim().is_empty() {
+            return Ok(r);
+        }
+    }
+    identity::set_my_relay(vault, DEFAULT_RELAY_ONION)?;
+    Ok(DEFAULT_RELAY_ONION.to_string())
 }
 
 /// Publica un pool de N KeyPackages en mi relay (para que peers offline puedan
@@ -648,6 +696,89 @@ async fn send_text(
     Ok(())
 }
 
+/// Inicia un handshake MLS live con un peer (rol Initiator). Equivalente al
+/// `balchat connect` del CLI pero sin REPL: solo establece el grupo y persiste.
+/// Reusa el endpoint del daemon (que ya tiene mi onion hosteado), por lo que
+/// requiere `start_daemon` previo. Emite eventos `balchat://message` con info
+/// del progreso para que la UI pueda dibujar feedback.
+#[tauri::command]
+async fn connect_cmd(
+    peer: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let (vault, identity, endpoint) = {
+        let inner = state.inner.lock().await;
+        let v = inner.vault.as_ref().ok_or("vault no abierto")?.clone();
+        let i = inner.identity.as_ref().ok_or("identidad no cargada")?.clone();
+        let e = inner
+            .endpoint
+            .as_ref()
+            .ok_or("daemon no arrancado: 'Arrancar daemon' primero")?
+            .clone();
+        (v, i, e)
+    };
+
+    let normalized = if peer.contains(':') {
+        peer.clone()
+    } else {
+        format!("{peer}:{VIRTUAL_PORT}")
+    };
+    let our_onion = vault
+        .kv_get(VAULT_KEY_MY_ONION)
+        .map_err(stringify)?
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .ok_or("aún no tengo onion propio — espera unos segundos a que el daemon lo provisione")?;
+
+    let _ = app.emit(
+        "balchat://message",
+        LogEntry::Info {
+            text: format!("dial directo a {normalized}…"),
+        },
+    );
+
+    // Same dial timeout as `send_with_fallback` so behaviour matches.
+    let stream = match tokio::time::timeout(Duration::from_secs(60), endpoint.dial(&normalized)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("dial falló: {e:#} — ¿está el peer online y escuchando?")),
+        Err(_) => return Err("dial timeout (60s) — el peer no respondió".into()),
+    };
+
+    let _ = app.emit(
+        "balchat://message",
+        LogEntry::Info {
+            text: "stream OK, handshake MLS…".into(),
+        },
+    );
+
+    let resolver = VaultResolver { vault: &vault };
+    let (mut conv, outcome) = Conversation::open(
+        stream,
+        &identity,
+        Role::Initiator,
+        &our_onion,
+        Some(normalized.as_str()),
+        &resolver,
+    )
+    .await
+    .map_err(|e| format!("handshake MLS falló: {e:#}"))?;
+    save_outcome(&vault, &outcome).map_err(stringify)?;
+    identity::save(&vault, &identity).map_err(stringify)?;
+    let _ = conv.say_goodbye().await;
+
+    let _ = app.emit(
+        "balchat://message",
+        LogEntry::Info {
+            text: format!("handshake OK con {normalized}"),
+        },
+    );
+    let _ = app.emit(
+        "balchat://contact-updated",
+        ContactUpdated { peer: normalized.clone() },
+    );
+    Ok(())
+}
+
 /// Manda un archivo del filesystem al peer. El frontend abre el dialog de selección
 /// (`tauri-plugin-dialog`) y pasa el path absoluto a este comando, que lee el archivo
 /// y lo serializa como `AppPayload::File`.
@@ -833,6 +964,19 @@ async fn run_daemon(inner_arc: Arc<Mutex<Inner>>, app: AppHandle) -> Result<()> 
 
     if let Some(ref r) = my_relay {
         let _ = poll_and_emit(&client, r, &my_queue, &vault, &identity, &app, max_messages).await;
+        // Auto-publish a small KeyPackage pool once per session so offline peers
+        // can invite us to groups via Welcome without manual setup. Errors here
+        // are non-fatal: the relay may be reachable later.
+        match identity::publish_keypackage_pool(&endpoint, &vault, &identity, DEFAULT_KP_POOL_SIZE).await {
+            Ok(pool) => {
+                let _ = app.emit("balchat://message", LogEntry::Info {
+                    text: format!("buzón listo · {pool} KeyPackages disponibles"),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("auto-publish KeyPackages falló: {e:#}");
+            }
+        }
     }
 
     loop {
@@ -1092,6 +1236,12 @@ async fn handle_incoming(
         LogEntry::Info {
             text: format!("conn entrante de {from}"),
         },
+    );
+    // Emit so the frontend refreshes the contact's `has_group` flag (banner away,
+    // composer unlocked) without waiting for the first inbound app message.
+    let _ = app.emit(
+        "balchat://contact-updated",
+        ContactUpdated { peer: from.clone() },
     );
 
     while let Some(payload) = conv.recv_app(identity).await? {
@@ -1392,6 +1542,7 @@ pub fn run() {
             list_messages_cmd,
             mark_contact_read_cmd,
             set_my_relay_cmd,
+            get_my_id,
             publish_kp_cmd,
             get_settings_cmd,
             set_settings_cmd,
@@ -1399,6 +1550,7 @@ pub fn run() {
             start_daemon,
             send_text,
             send_file_path,
+            connect_cmd,
         ])
         .setup(|app| {
             // En mobile, $HOME no existe — usamos el `app_local_data_dir` que da Tauri

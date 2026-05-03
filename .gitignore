@@ -47,3 +47,9 @@ crates/balchat-tauri/gen/schemas/
 # Briefs / artefactos generados localmente (PDF deck, exports)
 balchat-brief.pdf
 *.pdf
+
+# Relay binarios cross-compilados (los release los publican como GitHub Release
+# attachments; quien quiera self-host puede descargarlos o `cargo zigbuild`).
+deploy/relay/balchat-relay-x86_64
+deploy/relay/balchat-relay-aarch64
+deploy/relay/balchat-relay

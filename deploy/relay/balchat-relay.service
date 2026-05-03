@@ -1,0 +1,48 @@
+[Unit]
+Description=balchat relay (untrusted Tor onion mailbox)
+Documentation=https://github.com/xandru582/balchat
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=balchat-relay
+Group=balchat-relay
+
+# Binary + data dir set by install.sh
+ExecStart=/opt/balchat-relay/balchat-relay --data-dir /var/lib/balchat-relay --nickname balchat-relay
+WorkingDirectory=/var/lib/balchat-relay
+
+# Crash recovery: relay should always be up.
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+# Logging via journald.
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening ---
+# Relay only ever talks Tor outbound + persists to its data-dir. Lock down everything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/balchat-relay
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource limits (tweak if you operate at scale).
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

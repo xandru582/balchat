@@ -1,0 +1,26 @@
+/* Mobile-specific tokens & resets. Only loaded when the mobile layout is active.
+   Tweaks: larger touch targets, no tap highlight, safe-area handling, 16px
+   inputs to avoid iOS auto-zoom. */
+
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+
+  --m-header-h: 56px;
+  --m-touch: 44px;
+}
+
+html, body { overscroll-behavior-y: none; }
+
+button, a, [role="button"] {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+/* iOS won't auto-zoom on focus if input font-size >= 16px. */
+.mobile input,
+.mobile textarea {
+  font-size: 16px;
+}
