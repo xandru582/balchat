@@ -7,6 +7,30 @@ hits 1.0; while in 0.x.y, breaking changes can occur in any minor.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-03
+
+### Fixed
+
+- **iOS safe-area / Dynamic Island.** El `<meta viewport>` ahora incluye
+  `viewport-fit=cover`. Sin eso, `env(safe-area-inset-top)` devolvía `0`
+  y el header de la home (título *balchat* + pill de estado) quedaba
+  pegado/oculto detrás del Dynamic Island en iPhone con iOS 26.4. Ahora
+  las 6 pantallas móviles (`MobileHome`, `MobileChat`, `MobileLogin`,
+  `MobileNewContact`, `MobileEditContact`, `MobileSettings`) respetan
+  el inset top y el FAB respeta el home indicator.
+
+### Added
+
+- `.gitignore` excluye `crates/balchat-tauri/gen/apple/` (Xcode project
+  autogenerado por `cargo tauri ios init`, con paths absolutos de la
+  máquina; se regenera bajo demanda).
+
+### Notas
+
+- Los commits de docs publicados tras v0.1.3 — `LICENSE` Apache-2.0
+  completo + `CONTRIBUTING.md` + `SECURITY.md` + `PRIVACY.md` +
+  drafts de promo/outreach — quedan también bajo este tag.
+
 ## [0.1.3] — 2026-05-03
 
 ### Fixed
@@ -105,7 +129,8 @@ CLI worked end-to-end (host, connect, send, watch, groups, offline via
 relay). Desktop and Android Tauri UIs were minimal but functional. iOS
 scaffolded but unverified.
 
-[Unreleased]: https://github.com/xandru582/balchat/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/xandru582/balchat/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/xandru582/balchat/releases/tag/v0.1.4
 [0.1.3]: https://github.com/xandru582/balchat/releases/tag/v0.1.3
 [0.1.2]: https://github.com/xandru582/balchat/releases/tag/v0.1.2
 [0.1.1]: https://github.com/xandru582/balchat/releases/tag/v0.1.1

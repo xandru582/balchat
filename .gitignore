@@ -41,6 +41,10 @@ crates/balchat-tauri/gen/android/local.properties
 # Tauri schemas generados al build
 crates/balchat-tauri/gen/schemas/
 
+# Tauri iOS: Xcode project autogenerado por `cargo tauri ios init`,
+# depende de paths absolutos de cada máquina. Se regenera bajo demanda.
+crates/balchat-tauri/gen/apple/
+
 # Claude Code local state
 .claude/
 
