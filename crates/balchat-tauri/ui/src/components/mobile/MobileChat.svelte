@@ -13,6 +13,7 @@
     onSend,
     onAttach,
     onHandshake,
+    onEdit,
   } = $props()
 
   let draft = $state('')
@@ -82,6 +83,13 @@
         </small>
       </div>
     </div>
+    <button class="edit-btn" onclick={() => onEdit?.(contact)} aria-label="Editar contacto" title="Editar">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="5" cy="12" r="1.6"/>
+        <circle cx="12" cy="12" r="1.6"/>
+        <circle cx="19" cy="12" r="1.6"/>
+      </svg>
+    </button>
   </header>
 
   {#if contact && !contact.has_group}
@@ -181,6 +189,17 @@
     color: var(--accent);
   }
   .back:active { background: var(--bg-hover); }
+  .edit-btn {
+    width: var(--m-touch);
+    height: var(--m-touch);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: var(--fg-secondary);
+    flex-shrink: 0;
+  }
+  .edit-btn:active { background: var(--bg-hover); color: var(--fg); }
   .who {
     flex: 1;
     display: flex;

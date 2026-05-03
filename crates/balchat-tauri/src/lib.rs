@@ -558,6 +558,69 @@ async fn add_contact_cmd(
     Ok(())
 }
 
+/// Edita campos de un contacto existente identificado por `peer` (su onion).
+/// Cualquier campo `Some(...)` se actualiza; `None` se preserva. Útil para
+/// renombrar ("peer-mjfopp..." → "Marta"), corregir el buzón offline, o
+/// completar campos avanzados a posteriori sin tener que borrar y rehacer.
+#[tauri::command]
+async fn update_contact_cmd(
+    peer: String,
+    label: Option<String>,
+    relay: Option<String>,
+    queue_hex: Option<String>,
+    pubkey_hex: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let normalized = if peer.contains(':') {
+        peer.clone()
+    } else {
+        format!("{peer}:{VIRTUAL_PORT}")
+    };
+
+    let inner = state.inner.lock().await;
+    let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
+    let mut existing = vault
+        .get_contact_by_onion(&normalized)
+        .map_err(stringify)?
+        .ok_or("contacto desconocido")?;
+
+    if let Some(l) = label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        existing.label = l.to_string();
+    }
+    if let Some(r) = relay.as_deref().map(str::trim) {
+        // Permitir limpiar el relay (cadena vacía → None) y también setearlo.
+        existing.relay_onion = if r.is_empty() { None } else { Some(r.to_string()) };
+    }
+    if let Some(q) = queue_hex.as_deref().map(str::trim) {
+        if q.is_empty() {
+            existing.relay_queue_id = None;
+        } else {
+            let bytes = hex::decode(q).map_err(|e| format!("queue debe ser hex: {e}"))?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "queue_id debe ser 32 bytes (64 hex chars), recibido {} bytes",
+                    bytes.len()
+                ));
+            }
+            existing.relay_queue_id = Some(bytes);
+        }
+    }
+    if let Some(p) = pubkey_hex.as_deref().map(str::trim) {
+        if p.is_empty() {
+            existing.expected_pubkey = None;
+        } else {
+            let bytes = hex::decode(p).map_err(|e| format!("pubkey debe ser hex: {e}"))?;
+            if bytes.is_empty() || bytes.len() > 128 {
+                return Err(format!("pubkey de longitud inesperada: {} bytes", bytes.len()));
+            }
+            existing.expected_pubkey = Some(bytes);
+        }
+    }
+
+    vault.upsert_contact(&existing).map_err(stringify)?;
+    Ok(())
+}
+
 /// Borra un contacto del vault y todos sus mensajes asociados. `peer` se
 /// normaliza al puerto virtual igual que en los demás comandos.
 ///
@@ -749,24 +812,25 @@ async fn connect_cmd(
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .ok_or("aún no tengo onion propio — espera unos segundos a que el daemon lo provisione")?;
 
+    let display = display_peer(&vault, &normalized);
     let _ = app.emit(
         "balchat://message",
         LogEntry::Info {
-            text: format!("dial directo a {normalized}…"),
+            text: format!("conectando con {display}…"),
         },
     );
 
     // Same dial timeout as `send_with_fallback` so behaviour matches.
     let stream = match tokio::time::timeout(Duration::from_secs(60), endpoint.dial(&normalized)).await {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("dial falló: {e:#} — ¿está el peer online y escuchando?")),
-        Err(_) => return Err("dial timeout (60s) — el peer no respondió".into()),
+        Ok(Err(e)) => return Err(format!("no he podido conectar: {e:#} — ¿{display} tiene la app abierta?")),
+        Err(_) => return Err(format!("{display} no respondió (60s) — ¿tiene la app abierta?")),
     };
 
     let _ = app.emit(
         "balchat://message",
         LogEntry::Info {
-            text: "stream OK, handshake MLS…".into(),
+            text: "estableciendo cifrado…".into(),
         },
     );
 
@@ -788,7 +852,7 @@ async fn connect_cmd(
     let _ = app.emit(
         "balchat://message",
         LogEntry::Info {
-            text: format!("handshake OK con {normalized}"),
+            text: format!("conexión segura establecida con {display}"),
         },
     );
     let _ = app.emit(
@@ -972,7 +1036,7 @@ async fn run_daemon(inner_arc: Arc<Mutex<Inner>>, app: AppHandle) -> Result<()> 
     let _ = app.emit(
         "balchat://message",
         LogEntry::Info {
-            text: format!("listening: {our_onion}"),
+            text: "tu código está listo — ya puedes recibir mensajes".into(),
         },
     );
     {
@@ -992,9 +1056,9 @@ async fn run_daemon(inner_arc: Arc<Mutex<Inner>>, app: AppHandle) -> Result<()> 
         // can invite us to groups via Welcome without manual setup. Errors here
         // are non-fatal: the relay may be reachable later.
         match identity::publish_keypackage_pool(&endpoint, &vault, &identity, DEFAULT_KP_POOL_SIZE).await {
-            Ok(pool) => {
+            Ok(_) => {
                 let _ = app.emit("balchat://message", LogEntry::Info {
-                    text: format!("buzón listo · {pool} KeyPackages disponibles"),
+                    text: "buzón offline configurado".into(),
                 });
             }
             Err(e) => {
@@ -1255,10 +1319,11 @@ async fn handle_incoming(
     save_outcome(vault, &outcome)?;
     identity::save(vault, identity)?;
     let from = conv.peer_onion.clone();
+    let display = display_peer(vault, &from);
     let _ = app.emit(
         "balchat://message",
         LogEntry::Info {
-            text: format!("conn entrante de {from}"),
+            text: format!("{display} se ha conectado"),
         },
     );
     // Emit so the frontend refreshes the contact's `has_group` flag (banner away,
@@ -1294,10 +1359,11 @@ async fn handle_incoming(
                 if let Err(e) = vault.insert_message(&from, "received", "file", &filename) {
                     tracing::warn!("insert_message (live file) falló: {e:#}");
                 }
+                let display = display_peer(vault, &from);
                 let _ = app.emit(
                     "balchat://message",
                     LogEntry::Info {
-                        text: format!("[de {from}] archivo {filename} ({} bytes)", data.len()),
+                        text: format!("{display} te ha enviado: {filename} ({} bytes)", data.len()),
                     },
                 );
                 send_system_notification(
@@ -1513,6 +1579,24 @@ fn short_label(onion: &str) -> String {
     format!("peer-{}", onion.chars().take(8).collect::<String>())
 }
 
+/// Friendly display string for a peer in info/log messages: looks up the
+/// contact's `label` first, falls back to a short truncated onion. Avoids
+/// dumping the full 56-char onion address on the chat log when the user
+/// already has a name for that peer.
+fn display_peer(vault: &Vault, peer_onion: &str) -> String {
+    if let Ok(Some(c)) = vault.get_contact_by_onion(peer_onion) {
+        if !c.label.trim().is_empty() {
+            return c.label;
+        }
+    }
+    let bare = peer_onion.split(':').next().unwrap_or(peer_onion);
+    if bare.len() <= 22 {
+        bare.to_string()
+    } else {
+        format!("{}…{}", &bare[..6], &bare[bare.len() - 12..])
+    }
+}
+
 struct VaultResolver<'a> {
     vault: &'a Vault,
 }
@@ -1562,6 +1646,7 @@ pub fn run() {
             lock_vault,
             list_contacts,
             add_contact_cmd,
+            update_contact_cmd,
             delete_contact_cmd,
             list_messages_cmd,
             mark_contact_read_cmd,

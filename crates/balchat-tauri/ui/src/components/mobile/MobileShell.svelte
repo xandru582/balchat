@@ -9,6 +9,7 @@
   import MobileHome from './MobileHome.svelte'
   import MobileChat from './MobileChat.svelte'
   import MobileNewContact from './MobileNewContact.svelte'
+  import MobileEditContact from './MobileEditContact.svelte'
   import MobileSettings from './MobileSettings.svelte'
 
   let {
@@ -21,6 +22,8 @@
     handshakeBusy = false,
     onSelect,
     onAddContact,
+    onUpdateContact,
+    onDeleteContact,
     onSend,
     onAttach,
     onStartDaemon,
@@ -33,8 +36,9 @@
     onExportVault,
   } = $props()
 
-  // 'home' | 'chat' | 'new' | 'settings'
+  // 'home' | 'chat' | 'new' | 'edit' | 'settings'
   let screen = $state('home')
+  let editingContact = $state(null)
 
   function openChat(c) {
     onSelect?.(c)
@@ -49,9 +53,20 @@
   function openSettings() {
     screen = 'settings'
   }
+  function openEdit(contact) {
+    editingContact = contact
+    screen = 'edit'
+  }
+  function backFromEdit() {
+    editingContact = null
+    screen = 'chat'
+  }
 
   async function saveContact(payload) {
     await onAddContact?.(payload)
+  }
+  async function saveEdit(payload) {
+    await onUpdateContact?.(payload)
   }
 
   // Slide direction: push goes left-to-right out of the new screen, pop goes the other way.
@@ -85,6 +100,16 @@
         {onSend}
         {onAttach}
         {onHandshake}
+        onEdit={openEdit}
+      />
+    </div>
+  {:else if screen === 'edit'}
+    <div class="page" in:fly={{ x: 80, duration: 220, easing: quintOut }}>
+      <MobileEditContact
+        contact={editingContact}
+        onBack={backFromEdit}
+        onSave={saveEdit}
+        onDelete={(c) => onDeleteContact?.(c)}
       />
     </div>
   {:else if screen === 'new'}

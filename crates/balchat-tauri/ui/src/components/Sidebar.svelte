@@ -7,6 +7,7 @@
     onSelect,
     onDelete,
     onAddContact,
+    onUpdateContact,
   } = $props()
 
   let query = $state('')
@@ -15,6 +16,28 @@
   let addBusy = $state(false)
   let addError = $state('')
   let form = $state({ label: '', onion: '', relay: '', queue: '', pubkey: '' })
+
+  // Edit mode: when set, the form switches to "edit existing contact" — onion is
+  // read-only (it identifies the contact), label/relay/queue/pubkey are editable.
+  let editing = $state(null) // contact being edited, or null
+  function openEdit(c) {
+    editing = c
+    showAdd = false
+    addError = ''
+    form = {
+      label: c.label || '',
+      onion: c.onion_address || '',
+      relay: c.relay_onion || '',
+      queue: '', // hex shown only if user wants to overwrite (not pre-filled to avoid confusion)
+      pubkey: '',
+    }
+    showAdvanced = !!(c.relay_onion || c.unread_count === undefined)
+  }
+  function cancelEdit() {
+    editing = null
+    addError = ''
+    form = { label: '', onion: '', relay: '', queue: '', pubkey: '' }
+  }
 
   let filtered = $derived.by(() => {
     const q = query.trim().toLowerCase()
@@ -28,18 +51,29 @@
   async function submit() {
     addError = ''
     if (!form.label.trim()) { addError = 'El nombre es obligatorio'; return }
-    if (!form.onion.trim()) { addError = 'El código de chat es obligatorio'; return }
+    if (!editing && !form.onion.trim()) { addError = 'El código de chat es obligatorio'; return }
     addBusy = true
     try {
-      await onAddContact?.({
-        label: form.label.trim(),
-        onion: form.onion.trim(),
-        relay: form.relay.trim() || null,
-        queueHex: form.queue.trim() || null,
-        pubkeyHex: form.pubkey.trim() || null,
-      })
-      form = { label: '', onion: '', relay: '', queue: '', pubkey: '' }
-      showAdd = false
+      if (editing) {
+        await onUpdateContact?.({
+          peer: editing.onion_address,
+          label: form.label.trim(),
+          relay: form.relay.trim(),       // empty string clears
+          queueHex: form.queue.trim(),    // empty string clears
+          pubkeyHex: form.pubkey.trim(),  // empty string clears
+        })
+        cancelEdit()
+      } else {
+        await onAddContact?.({
+          label: form.label.trim(),
+          onion: form.onion.trim(),
+          relay: form.relay.trim() || null,
+          queueHex: form.queue.trim() || null,
+          pubkeyHex: form.pubkey.trim() || null,
+        })
+        form = { label: '', onion: '', relay: '', queue: '', pubkey: '' }
+        showAdd = false
+      }
     } catch (e) {
       addError = String(e)
     } finally {
@@ -84,23 +118,32 @@
     {/if}
   </div>
 
-  {#if showAdd}
+  {#if showAdd || editing}
     <form class="add-form" onsubmit={(e) => { e.preventDefault(); submit() }}>
-      <h4>Nuevo contacto</h4>
+      <div class="form-head">
+        <h4>{editing ? `Editar ${editing.label}` : 'Nuevo contacto'}</h4>
+        {#if editing}
+          <button type="button" class="close-edit" onclick={cancelEdit} title="Cancelar">×</button>
+        {/if}
+      </div>
       <input type="text" placeholder="Nombre (ej: Alice)" bind:value={form.label} disabled={addBusy} />
-      <input type="text" placeholder="Código de chat de tu contacto" bind:value={form.onion} disabled={addBusy} />
+      {#if !editing}
+        <input type="text" placeholder="Código de chat de tu contacto" bind:value={form.onion} disabled={addBusy} />
+      {:else}
+        <input type="text" value={form.onion} disabled readonly class="readonly" title="El código de chat no se puede cambiar" />
+      {/if}
       <button
         type="button"
         class="adv-toggle"
         onclick={() => (showAdvanced = !showAdvanced)}
       >{showAdvanced ? '− Ocultar opciones avanzadas' : '+ Opciones avanzadas'}</button>
       {#if showAdvanced}
-        <input type="text" placeholder="Buzón offline propio (opcional)" bind:value={form.relay} disabled={addBusy} />
+        <input type="text" placeholder={editing ? 'Buzón offline (vacío = quitar)' : 'Buzón offline propio (opcional)'} bind:value={form.relay} disabled={addBusy} />
         <input type="text" placeholder="Queue ID 64-hex (opcional)" bind:value={form.queue} disabled={addBusy} />
         <input type="text" placeholder="Pubkey hex (opcional)" bind:value={form.pubkey} disabled={addBusy} />
       {/if}
       <button class="primary" type="submit" disabled={addBusy}>
-        {addBusy ? 'Guardando…' : 'Guardar contacto'}
+        {addBusy ? 'Guardando…' : (editing ? 'Guardar cambios' : 'Guardar contacto')}
       </button>
       {#if addError}<p class="error">{addError}</p>{/if}
     </form>
@@ -126,6 +169,7 @@
           active={selected?.onion_address === c.onion_address}
           onSelect={(x) => onSelect?.(x)}
           onDelete={(x, ev) => onDelete?.(x, ev)}
+          onEdit={(x) => openEdit(x)}
         />
       {/each}
     {/if}
@@ -214,12 +258,40 @@
     box-shadow: var(--shadow-sm);
   }
   .add-form h4 {
-    margin: 0 0 2px;
+    margin: 0;
     font-size: 12.5px;
     font-weight: 600;
     color: var(--fg-secondary);
     letter-spacing: 0.01em;
     text-transform: uppercase;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .form-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 2px;
+  }
+  .close-edit {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    color: var(--fg-tertiary);
+    background: transparent;
+    font-size: 16px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .close-edit:hover { background: var(--bg-hover); color: var(--fg); }
+  .add-form input.readonly {
+    color: var(--fg-tertiary);
+    cursor: not-allowed;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .add-form input { font-size: 12.5px; padding: 6px 8px; }
   .adv-toggle {

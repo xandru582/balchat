@@ -229,6 +229,11 @@
     await refreshContacts()
   }
 
+  async function updateContact({ peer, label, relay, queueHex, pubkeyHex }) {
+    await invoke('update_contact_cmd', { peer, label, relay, queueHex, pubkeyHex })
+    await refreshContactsAndSelected()
+  }
+
   async function deleteContact(c) {
     const ok = window.confirm(`¿Borrar contacto «${c.label}» y todo su historial?\nEsta acción no se puede deshacer.`)
     if (!ok) return
@@ -368,6 +373,8 @@
       {handshakeBusy}
       onSelect={selectContact}
       onAddContact={addContact}
+      onUpdateContact={updateContact}
+      onDeleteContact={deleteContact}
       onSend={sendMessage}
       onAttach={attachFile}
       onStartDaemon={startDaemon}
@@ -387,6 +394,7 @@
         onSelect={selectContact}
         onDelete={deleteContact}
         onAddContact={addContact}
+        onUpdateContact={updateContact}
       />
       <ChatView
         {selected}

@@ -2,7 +2,7 @@
   import Avatar from './Avatar.svelte'
   import { fmtSidebarTime, previewText } from '../lib/format.js'
 
-  let { contact, active = false, onSelect, onDelete } = $props()
+  let { contact, active = false, onSelect, onDelete, onEdit } = $props()
 
   let preview = $derived(previewText(contact))
   let timeLabel = $derived(fmtSidebarTime(contact.last_created_at))
@@ -41,17 +41,30 @@
     </div>
   </div>
 
-  <button
-    class="del"
-    type="button"
-    onclick={(e) => { e.stopPropagation(); onDelete?.(contact, e) }}
-    aria-label="Borrar contacto {contact.label}"
-    title="Borrar contacto"
-  >
-    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-    </svg>
-  </button>
+  <div class="actions">
+    <button
+      class="action-btn edit"
+      type="button"
+      onclick={(e) => { e.stopPropagation(); onEdit?.(contact, e) }}
+      aria-label="Editar contacto {contact.label}"
+      title="Editar contacto"
+    >
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M11 2l3 3-8 8H3v-3l8-8z"/>
+      </svg>
+    </button>
+    <button
+      class="action-btn del"
+      type="button"
+      onclick={(e) => { e.stopPropagation(); onDelete?.(contact, e) }}
+      aria-label="Borrar contacto {contact.label}"
+      title="Borrar contacto"
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </div>
 </div>
 
 <style>
@@ -134,20 +147,23 @@
     background: var(--success);
     flex-shrink: 0;
   }
-  .del {
+  .actions {
+    display: flex;
+    gap: 2px;
+    opacity: 0;
+    transition: opacity 100ms ease;
+  }
+  .row:hover .actions,
+  .actions:focus-within { opacity: 1; }
+  .action-btn {
     width: 22px; height: 22px;
     border-radius: 50%;
     color: var(--fg-tertiary);
     display: flex; align-items: center; justify-content: center;
-    opacity: 0;
-    transition: opacity 100ms ease, background 100ms ease, color 100ms ease;
+    transition: background 100ms ease, color 100ms ease;
   }
-  .row:hover .del,
-  .del:focus-visible { opacity: 1; }
-  .del:hover {
-    background: var(--danger);
-    color: #fff;
-  }
-  .row.active .del { color: rgba(255, 255, 255, 0.7); }
-  .row.active .del:hover { background: rgba(255, 255, 255, 0.22); color: #fff; }
+  .action-btn.edit:hover { background: var(--accent); color: #fff; }
+  .action-btn.del:hover  { background: var(--danger); color: #fff; }
+  .row.active .action-btn { color: rgba(255, 255, 255, 0.7); }
+  .row.active .action-btn:hover { background: rgba(255, 255, 255, 0.22); color: #fff; }
 </style>
