@@ -2,35 +2,42 @@ Categories:
   - Internet
   - Security
 
-License: AGPL-3.0-or-later
+License: Apache-2.0
 
-AuthorName: Alejandro
-SourceCode: https://github.com/alejandro/balchat
+AuthorName: xandru582
+AuthorEmail: xandru2222@gmail.com
+WebSite: https://baluniverse.pages.dev/#balchat
+SourceCode: https://github.com/xandru582/balchat
+IssueTracker: https://github.com/xandru582/balchat/issues
+Changelog: https://github.com/xandru582/balchat/blob/main/CHANGELOG.md
 
 Summary: Chat E2E con MLS sobre Tor onion services
+
 Description: |-
     balchat es una app de mensajería 1:1 y de grupos n-way con cifrado E2E vía
     MLS (RFC 9420), transportada sobre Tor onion services v3. Sin cuentas, sin
     números de teléfono, sin servidores centrales obligatorios.
 
     Características:
-      * Cifrado E2E con MLS (forward secrecy + post-compromise security)
-      * Transporte Tor v3 onion service vía arti-client (pure Rust)
-      * Mensajería offline vía relay no-confiable (los blobs son ciphertext)
-      * Vault SQLCipher cifrado con Argon2id KDF
-      * Chunking automático para archivos > 12 MiB
-      * Foreground service en Android para recibir mensajes en background
+
+    * Cifrado E2E con MLS (forward secrecy + post-compromise security)
+    * Transporte Tor v3 onion service vía arti-client (pure Rust)
+    * Mensajería offline vía relay no-confiable (los blobs son ciphertext)
+    * Vault SQLCipher cifrado con Argon2id KDF
+    * Chunking automático para archivos > 12 MiB
+    * Foreground service en Android para recibir mensajes en background
+    * Buzón offline público por defecto (configurable / self-host)
 
     Estado: prototipo / spike funcional. No usar en escenarios reales hasta que
     haya auditoría externa.
 
 RepoType: git
-Repo: https://github.com/alejandro/balchat.git
+Repo: https://github.com/xandru582/balchat.git
 
 Builds:
-  - versionName: 0.0.1
-    versionCode: 1
-    commit: HEAD
+  - versionName: 0.1.3
+    versionCode: 4
+    commit: v0.1.3
     sudo:
       - apt-get update
       - apt-get install -y openjdk-21-jdk-headless protobuf-compiler libssl-dev pkg-config
@@ -46,8 +53,7 @@ Builds:
       cargo tauri android build --target aarch64 --apk
     output: crates/balchat-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
 
-# Cómo el bot de FDroid firma su build (lo hace fdroidserver, no nuestro código).
-AutoUpdateMode: Version
+AutoUpdateMode: Version v%v
 UpdateCheckMode: Tags
-CurrentVersion: 0.0.1
-CurrentVersionCode: 1
+CurrentVersion: 0.1.3
+CurrentVersionCode: 4

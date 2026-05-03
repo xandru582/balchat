@@ -1,8 +1,19 @@
 # balchat
 
+[![Release](https://img.shields.io/github/v/release/xandru582/balchat?style=flat-square&color=b14bff)](https://github.com/xandru582/balchat/releases/latest)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-007aff?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Tauri 2](https://img.shields.io/badge/UI-Tauri%202-24c8db?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app/)
+[![Tor onion services](https://img.shields.io/badge/network-Tor%20onion%20v3-7d4698?style=flat-square)](https://community.torproject.org/onion-services/)
+[![MLS RFC 9420](https://img.shields.io/badge/crypto-MLS%20%C2%A7RFC%209420-2dffa6?style=flat-square)](https://datatracker.ietf.org/doc/rfc9420/)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Android%20%C2%B7%20Linux%20%C2%B7%20Windows-ffd84a?style=flat-square)](https://github.com/xandru582/balchat/releases/latest)
+
 > Chat 1:1 y grupos n-way **cifrados E2E con MLS**, transportado **sobre Tor onion services v3**,
 > con **mensajería offline** vía un relay no-confiable. Sin servidores centrales obligatorios,
 > sin números de teléfono, sin email. **Todo en Rust** + UI Tauri 2 (desktop + Android).
+
+**🌐 Web · descargas**: <https://baluniverse.pages.dev/#balchat>
+**📦 Última release**: <https://github.com/xandru582/balchat/releases/latest>
 
 > ⚠️ **Estado: prototipo / spike funcional.** Los cuatro binarios principales
 > (CLI + relay + desktop + APK) compilan release y arrancan en
@@ -10,6 +21,20 @@
 > y **iOS** queda scaffolded pero sin verificar en device (ver
 > [docs/ios-build.md](docs/ios-build.md)). No usar en escenarios reales hasta
 > que haya audit.
+
+## Quickstart usuario
+
+1. **Descarga** la app para tu plataforma desde [releases/latest](https://github.com/xandru582/balchat/releases/latest):
+   - **macOS** (Apple Silicon): `balchat.dmg`
+   - **Android** (arm64): `balchat.apk`
+2. **macOS**: si Gatekeeper dice *"está dañado"*, abre Terminal y ejecuta `xattr -cr /Applications/balchat.app` después de copiar la app a Aplicaciones.
+3. **Android**: permite *fuentes desconocidas* en tu navegador antes de tocar el APK.
+4. Crea tu cuenta con una contraseña que solo tú sepas.
+5. Espera unos segundos a que se prepare tu *código de chat*.
+6. Comparte tu código con tu contacto. Cuando os añadáis mutuamente, uno toca *Conectar* y a chatear.
+
+¿Quieres montar tu propio buzón offline en una VPS? Está en
+[`deploy/relay/`](deploy/relay/) — `install.sh` + systemd unit hardened.
 
 | Target | Verificado en esta máquina | Cómo |
 |---|---|---|
