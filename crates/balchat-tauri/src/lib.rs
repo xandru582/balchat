@@ -20,6 +20,7 @@ use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
 use openmls_traits::OpenMlsProvider;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,26 @@ const DEFAULT_RELAY_ONION: &str =
 /// Initial KeyPackage pool size auto-published once per session. Lets offline
 /// peers invite us via Welcome without us having to be online.
 const DEFAULT_KP_POOL_SIZE: u32 = 10;
+
+/// Same key the balchat-core identity module uses internally — duplicated here
+/// because we need to overwrite the random queue ID generated at first unlock
+/// with a deterministic one (`derive_queue_id(my_onion)`). Keeps both sides of
+/// any conversation able to find each other's mailbox without exchanging the
+/// queue ID out-of-band.
+const VAULT_KEY_QUEUE_ID: &str = "queue_id.v1";
+
+/// Derives a 32-byte queue ID from an onion address. SHA256 with a domain
+/// separator so the digest can't be reused as another key elsewhere.
+/// Deterministic — knowing the peer's onion is enough to know their mailbox.
+/// (The contents are still MLS ciphertext, so this leaks zero confidentiality.)
+fn derive_queue_id(onion_address: &str) -> Vec<u8> {
+    // Strip any :port suffix so `xxx.onion` and `xxx.onion:1234` derive the same.
+    let bare = onion_address.split(':').next().unwrap_or(onion_address);
+    let mut hasher = Sha256::new();
+    hasher.update(b"balchat-queue-v1\0");
+    hasher.update(bare.as_bytes());
+    hasher.finalize().to_vec()
+}
 
 // -------- AppState compartido --------
 
@@ -511,9 +532,13 @@ async fn add_contact_cmd(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .or_else(|| embedded_queue.filter(|s| !s.is_empty()));
+    // If neither an explicit queue nor an embedded `#queue` was given, derive
+    // one deterministically from the peer's onion. Mirrors what `run_daemon`
+    // does for our own queue — guarantees a peer added with just an onion
+    // string still works for offline messaging.
     let queue_id = match effective_queue_hex.as_deref() {
         Some(s) => Some(hex::decode(s).map_err(|e| format!("queue debe ser hex: {e}"))?),
-        None => None,
+        None => Some(derive_queue_id(&normalized)),
     };
     if let Some(q) = &queue_id {
         if q.len() != 32 {
@@ -955,12 +980,13 @@ async fn send_with_fallback(
         .relay_onion
         .clone()
         .unwrap_or_else(|| DEFAULT_RELAY_ONION.to_string());
+    // Backwards-compatible: pre-v0.1.3 contacts that were added before queue IDs
+    // became deterministic (or auto-added before v0.1.3) won't have queue_id
+    // set — derive from peer's onion so offline sends still work.
     let queue_id = contact
         .relay_queue_id
         .clone()
-        .ok_or_else(|| anyhow!(
-            "no sé el buzón del peer — pídele que comparta su \"código de chat\" completo y bórralo y vuelve a añadirlo"
-        ))?;
+        .unwrap_or_else(|| derive_queue_id(peer_onion));
     let group_id = contact
         .mls_group_id
         .clone()
@@ -1032,6 +1058,11 @@ async fn run_daemon(inner_arc: Arc<Mutex<Inner>>, app: AppHandle) -> Result<()> 
         (v, i)
     };
     vault.kv_set(VAULT_KEY_MY_ONION, our_onion.as_bytes())?;
+    // Overwrite the random queue ID created at first unlock with one derived
+    // from our onion. Now any peer who knows our onion knows where to deposit
+    // offline blobs — no out-of-band queue exchange needed.
+    let derived = derive_queue_id(&our_onion);
+    vault.kv_set(VAULT_KEY_QUEUE_ID, &derived)?;
     emit_status(&app, "running");
     let _ = app.emit(
         "balchat://message",
@@ -1561,22 +1592,46 @@ fn save_outcome(vault: &Vault, outcome: &HandshakeOutcome) -> Result<()> {
             format!("{peer_onion}:{VIRTUAL_PORT}")
         };
         let existing = vault.get_contact_by_onion(&onion)?;
-        let label = existing
-            .as_ref()
-            .map(|c| c.label.clone())
-            .unwrap_or_else(|| short_label(&onion));
+        // For an existing contact, preserve the user-chosen fields; only
+        // re-stamp the MLS group id. For a *new* contact (handshake-induced
+        // auto-add), pre-fill `relay_onion` + `relay_queue_id` so that offline
+        // sends just work without the user having to add it manually with the
+        // peer's full "código de chat".
+        let (label, relay_onion, relay_queue_id) = match existing.as_ref() {
+            Some(c) => (
+                c.label.clone(),
+                c.relay_onion.clone(),
+                c.relay_queue_id.clone(),
+            ),
+            None => (
+                short_label(&onion),
+                Some(DEFAULT_RELAY_ONION.to_string()),
+                Some(derive_queue_id(&onion)),
+            ),
+        };
         vault.upsert_contact(&Contact {
             label,
             onion_address: onion,
             mls_group_id: Some(group_id.clone()),
+            relay_onion,
+            relay_queue_id,
             ..Default::default()
         })?;
     }
     Ok(())
 }
 
+/// Friendly label assigned to peers we discover through inbound handshakes.
+/// We don't know their real name yet — the user can rename via "Editar
+/// contacto". Showing just a truncated onion is less alarming than the old
+/// `peer-{8chars}` cryptic prefix.
 fn short_label(onion: &str) -> String {
-    format!("peer-{}", onion.chars().take(8).collect::<String>())
+    let bare = onion.split(':').next().unwrap_or(onion);
+    if bare.len() >= 8 {
+        format!("Nuevo · {}", &bare[..6])
+    } else {
+        format!("Nuevo · {bare}")
+    }
 }
 
 /// Friendly display string for a peer in info/log messages: looks up the
