@@ -509,7 +509,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "balchat-cli"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "balchat-core",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "balchat-core"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "balchat-relay"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "balchat-core",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "balchat-relay-proto"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ciborium",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "balchat-storage"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "balchat-tauri"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "balchat-core",
@@ -6039,7 +6039,7 @@ dependencies = [
 
 [[package]]
 name = "spike-mls"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "openmls",
@@ -6052,7 +6052,7 @@ dependencies = [
 
 [[package]]
 name = "spike-tor"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arti-client",

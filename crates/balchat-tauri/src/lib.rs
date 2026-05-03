@@ -488,16 +488,30 @@ async fn add_contact_cmd(
     if label.is_empty() {
         return Err("label no puede estar vacío".into());
     }
-    let onion = onion.trim().to_string();
-    if onion.is_empty() {
+    // Códigos de chat extendidos: `xxx.onion#queueHex` empaqueta el onion + queue
+    // del peer en una sola cadena que el usuario puede compartir. Si el queue
+    // viene en el `#…`, lo usamos como default cuando no se pasó `queue_hex`
+    // explícito.
+    let onion_raw = onion.trim().to_string();
+    if onion_raw.is_empty() {
         return Err("onion no puede estar vacío".into());
     }
-    let normalized = if onion.contains(':') {
-        onion.clone()
-    } else {
-        format!("{onion}:{VIRTUAL_PORT}")
+    let (onion_only, embedded_queue) = match onion_raw.split_once('#') {
+        Some((o, q)) => (o.trim().to_string(), Some(q.trim().to_string())),
+        None => (onion_raw, None),
     };
-    let queue_id = match queue_hex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let normalized = if onion_only.contains(':') {
+        onion_only
+    } else {
+        format!("{onion_only}:{VIRTUAL_PORT}")
+    };
+    let effective_queue_hex = queue_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| embedded_queue.filter(|s| !s.is_empty()));
+    let queue_id = match effective_queue_hex.as_deref() {
         Some(s) => Some(hex::decode(s).map_err(|e| format!("queue debe ser hex: {e}"))?),
         None => None,
     };
@@ -518,11 +532,16 @@ async fn add_contact_cmd(
             return Err(format!("pubkey de longitud inesperada: {} bytes", p.len()));
         }
     }
+    // Default-fallback al buzón público si el peer no especificó uno: la mayoría
+    // de usuarios non-técnicos usan el default (`ensure_default_relay`), así que
+    // asumir el mismo cuando no nos lo dicen es lo correcto. El usuario avanzado
+    // puede override en "Opciones avanzadas" del formulario.
     let relay_onion = relay
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| Some(DEFAULT_RELAY_ONION.to_string()));
 
     let inner = state.inner.lock().await;
     let vault = inner.vault.as_ref().ok_or("vault no abierto")?;
@@ -864,15 +883,20 @@ async fn send_with_fallback(
     if let Ok(Ok(stream)) = dial {
         return send_via_direct(stream, identity, vault, peer_onion, payload).await;
     }
-    // fallback al relay
+    // fallback al relay — si el contact no especifica relay, asumimos el público
+    // por defecto (`DEFAULT_RELAY_ONION`). El queue del peer no es deducible:
+    // tiene que venir en el "código de chat" (`onion#queueHex`) o se setea
+    // manualmente en Opciones avanzadas.
     let relay_onion = contact
         .relay_onion
         .clone()
-        .ok_or_else(|| anyhow!("contact sin --relay y peer no responde directo"))?;
+        .unwrap_or_else(|| DEFAULT_RELAY_ONION.to_string());
     let queue_id = contact
         .relay_queue_id
         .clone()
-        .ok_or_else(|| anyhow!("contact sin --queue"))?;
+        .ok_or_else(|| anyhow!(
+            "no sé el buzón del peer — pídele que comparta su \"código de chat\" completo y bórralo y vuelve a añadirlo"
+        ))?;
     let group_id = contact
         .mls_group_id
         .clone()

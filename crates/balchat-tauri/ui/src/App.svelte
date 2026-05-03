@@ -314,8 +314,16 @@
   }
 
   // -------- Clipboard --------
+  /** Builds the share string the user copies. Embeds the queue ID so the peer
+   *  can deliver offline messages without us setting up anything manual. */
+  function buildShareCode() {
+    const onion = (myId.onion || '').replace(/:\d+$/, '')
+    if (!onion) return ''
+    return myId.queue ? `${onion}#${myId.queue}` : onion
+  }
+
   async function copyOnion() {
-    const v = (myId.onion || '').replace(/:\d+$/, '')
+    const v = buildShareCode()
     if (!v) return 'err'
     try {
       await navigator.clipboard.writeText(v)
