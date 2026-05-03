@@ -569,4 +569,67 @@ Cobertura actual (30/30 passing):
 
 ## Licencia
 
-A definir. Por ahora código privado.
+[**Apache License 2.0**](LICENSE).
+
+Apache 2.0 incluye una concesión explícita de patentes — relevante para
+una app de mensajería que usa MLS (RFC 9420) y otros protocolos
+potencialmente cubiertos por patentes. Compatible con GPL v3 y con la
+mayoría de licencias FOSS.
+
+Si contribuyes al proyecto vía pull request, tu contribución se licencia
+bajo los mismos términos (ver [CONTRIBUTING.md](CONTRIBUTING.md) §1).
+
+---
+
+## Cómo contribuir
+
+balchat es 100 % open source y se mantiene en abierto. **Cualquier
+persona puede participar** — sin gatekeeping, sin invitaciones, sin
+hacer falta hablar conmigo antes.
+
+### Formas de aportar (de menos a más esfuerzo)
+
+1. **Probar y reportar bugs**: instala una release, úsala con un amigo,
+   abre un issue en <https://github.com/xandru582/balchat/issues> con
+   pasos de reproducción. Es lo más útil ahora mismo (proyecto en 0.1.x).
+2. **Documentación**: errores en este README, en `docs/`, traducciones a
+   otros idiomas (la app está en español; un PR con strings inglés sería
+   bienvenido). Sin necesidad de saber Rust.
+3. **Operar un relay público**: monta uno con
+   [`deploy/relay/install.sh`](deploy/relay/) en una VPS y compártelo —
+   descentraliza el "buzón offline" y reduces la dependencia del relay
+   público que opero yo.
+4. **Triage de issues**: comentar en issues abiertos, reproducir bugs
+   ajenos, etiquetar duplicados.
+5. **Pull requests de código**: ver
+   [CONTRIBUTING.md](CONTRIBUTING.md) para setup, estilo, y checklist.
+   Empieza por un issue etiquetado `good first issue` si no tienes idea
+   por dónde empezar.
+6. **Reportar vulnerabilidades**: ver [SECURITY.md](SECURITY.md). En
+   privado primero, por favor — coordinación responsable, 90 días de
+   ventana de disclosure.
+7. **Auditoría externa**: si trabajas en cripto/seguridad y quieres
+   hacer review pro bono o coordinar una via OSTIF / Open Tech Fund —
+   email a xandru2222@gmail.com. Es lo que más necesita el proyecto
+   antes de poder recomendarse para uso real.
+8. **Donar tiempo a otras formas de visibilidad**: traducir la web
+   ([baluniverse repo](https://github.com/xandru582/baluniverse)),
+   añadir balchat a más [awesome-* lists](promo/), tootear sobre el
+   proyecto, escribir en tu blog.
+
+### Comunidad
+
+- Discusión técnica + Q&A: GitHub
+  [Discussions](https://github.com/xandru582/balchat/discussions) (a
+  habilitar — abre un issue pidiéndolo si te urge).
+- Issues + bugs: <https://github.com/xandru582/balchat/issues>.
+- Mastodon (futuro): `@xandru582@fosstodon.org` (cuenta a crear).
+- Mirror del repo en Codeberg (planeado): para no depender solo de
+  GitHub.
+
+### Code of conduct
+
+Sé respetuoso. No discriminación, no acoso. Punto. Para el detalle, el
+proyecto adopta el
+[Contributor Covenant v2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
+Si alguien lo viola, escribe a xandru2222@gmail.com — se actúa.
