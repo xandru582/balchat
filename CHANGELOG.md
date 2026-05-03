@@ -21,6 +21,12 @@ hits 1.0; while in 0.x.y, breaking changes can occur in any minor.
 
 ### Added
 
+- **Artefacto iOS sin firmar (`balchat.ipa`)** en GitHub Releases para
+  sideload manual con AltStore / SideStore / Xcode. No es tap-to-install
+  porque eso requiere Apple Developer Program ($99/año) — el
+  `pbxproj` autogenerado se patchea localmente para construir sin
+  team ID. iOS sigue marcado como `scaffolded` (sin
+  `BGProcessingTask` para mensajes en background).
 - `.gitignore` excluye `crates/balchat-tauri/gen/apple/` (Xcode project
   autogenerado por `cargo tauri ios init`, con paths absolutos de la
   máquina; se regenera bajo demanda).
